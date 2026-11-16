@@ -3,7 +3,7 @@
 """
 ========================================================================
                           WHISPER STUDIO
-                Studio Edition (v2.7.5) — Windows Edition
+                Studio Edition (v3.0.5) — Windows Edition
     Offline Audio & Video Transcription with NVIDIA CUDA & Intel/AMD CPU
 ========================================================================
 """
@@ -20,8 +20,13 @@ import multiprocessing
 import threading
 import ctypes
 import json
+import html
 import logging
+import urllib.request
 from pathlib import Path
+
+APP_VERSION = "3.0.5"
+GITHUB_REPO = "Ritolino/WhisperStudio"
 
 # Set resilient timeouts for Hugging Face Hub downloads and network requests
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
@@ -32,7 +37,7 @@ multiprocessing.freeze_support()
 
 # Explicit Windows AppUserModelID for taskbar branding and icon association
 try:
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("WhisperStudio.WindowsEdition.2.7.5")
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("WhisperStudio.WindowsEdition.3.0.5")
 except Exception:
     pass
 
@@ -71,10 +76,14 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QFrame, QFileDialog, QMessageBox,
     QAbstractItemView, QDialog, QSizePolicy, QTextBrowser, QMenu
 )
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QPoint, QPointF, QRectF, QMimeData, QSize, QSettings, QLocale
+from PyQt6.QtCore import (
+    Qt, QTimer, QThread, pyqtSignal, pyqtProperty, QPropertyAnimation, QEasingCurve,
+    QPoint, QPointF, QRectF, QMimeData, QSize, QSettings, QLocale, QUrl
+)
 from PyQt6.QtGui import (
     QIcon, QPixmap, QDragEnterEvent, QDropEvent, QDrag, QPainter,
-    QColor, QPen, QPainterPath, QAction, QActionGroup, QLinearGradient, QFont
+    QColor, QPen, QPainterPath, QAction, QActionGroup, QLinearGradient, QFont, QDesktopServices,
+    QCursor
 )
 
 # Resolve base directory for assets and portable environment
@@ -181,50 +190,59 @@ def detect_hardware():
 
     return ("cpu", "int8", "CPU MULTITHREAD", "#f59e0b", "💻 Intel / AMD • CPU Multithread")
 
+_NVML_LIB = None
+_NVML_INITIALIZED = False
+_NVML_UNAVAILABLE = False
+
+
 def get_vram_info():
-    """Retrieves real VRAM usage on NVIDIA GPU via nvml.dll."""
+    """Retrieves real VRAM usage on NVIDIA GPU via cached nvml.dll handle."""
+    global _NVML_LIB, _NVML_INITIALIZED, _NVML_UNAVAILABLE
+    if _NVML_UNAVAILABLE:
+        return None
     try:
-        try:
-            nvml = ctypes.CDLL("nvml.dll")
-        except Exception:
-            nvml = ctypes.CDLL(r"C:\Program Files\NVIDIA Corporation\NVSMI\nvml.dll")
-        if nvml.nvmlInit_v2() != 0:
-            return None
-        try:
-            class NVMemory(ctypes.Structure):
-                _fields_ = [
-                    ("total", ctypes.c_ulonglong),
-                    ("free", ctypes.c_ulonglong),
-                    ("used", ctypes.c_ulonglong)
-                ]
-
-            count = ctypes.c_uint(0)
+        if _NVML_LIB is None:
             try:
-                if nvml.nvmlDeviceGetCount_v2(ctypes.byref(count)) != 0 or count.value < 1:
-                    count.value = 1
+                _NVML_LIB = ctypes.CDLL("nvml.dll")
             except Exception:
-                count.value = 1
-
-            best_used = None
-            best_total = -1
-            for idx in range(count.value):
-                handle = ctypes.c_void_p()
-                if nvml.nvmlDeviceGetHandleByIndex_v2(idx, ctypes.byref(handle)) == 0:
-                    mem = NVMemory()
-                    if nvml.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem)) == 0 and mem.total > best_total:
-                        best_total = mem.total
-                        best_used = mem.used
-
-            if best_total <= 0 or best_used is None:
+                _NVML_LIB = ctypes.CDLL(r"C:\Program Files\NVIDIA Corporation\NVSMI\nvml.dll")
+        if not _NVML_INITIALIZED:
+            if _NVML_LIB.nvmlInit_v2() != 0:
                 return None
-            total_gb = best_total / (1024 ** 3)
-            used_gb = best_used / (1024 ** 3)
-            return round(used_gb, 1), round(total_gb, 1)
-        finally:
-            try:
-                nvml.nvmlShutdown()
-            except Exception:
-                pass
+            _NVML_INITIALIZED = True
+
+        class NVMemory(ctypes.Structure):
+            _fields_ = [
+                ("total", ctypes.c_ulonglong),
+                ("free", ctypes.c_ulonglong),
+                ("used", ctypes.c_ulonglong)
+            ]
+
+        count = ctypes.c_uint(0)
+        try:
+            if _NVML_LIB.nvmlDeviceGetCount_v2(ctypes.byref(count)) != 0 or count.value < 1:
+                count.value = 1
+        except Exception:
+            count.value = 1
+
+        best_used = None
+        best_total = -1
+        for idx in range(count.value):
+            handle = ctypes.c_void_p()
+            if _NVML_LIB.nvmlDeviceGetHandleByIndex_v2(idx, ctypes.byref(handle)) == 0:
+                mem = NVMemory()
+                if _NVML_LIB.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem)) == 0 and mem.total > best_total:
+                    best_total = mem.total
+                    best_used = mem.used
+
+        if best_total <= 0 or best_used is None:
+            return None
+        total_gb = best_total / (1024 ** 3)
+        used_gb = best_used / (1024 ** 3)
+        return round(used_gb, 1), round(total_gb, 1)
+    except OSError:
+        _NVML_UNAVAILABLE = True
+        return None
     except Exception:
         return None
 
@@ -327,48 +345,111 @@ def format_size(bytes_size: int) -> str:
     else:
         return f"{bytes_size / (1024 * 1024):.1f} MB"
 
-def generate_output_path(p_in: Path, fmt: str, lang: str = "it") -> Path:
+def generate_output_base_stem(p_in: Path, lang: str = "it") -> str:
     """
-    Generate clean transcription output path in the source folder formatted as:
-    'Trascrizione [data del file in gg-mm-aa - oo.mm].[fmt]' or 'Trascrizione [nome-pulito].[fmt]'
+    Generate clean transcription output base stem (without extension).
+    - If the filename has a timestamp (e.g. YYYYMMDD_HHMM or DD-MM-YYYY_HHMM), it formats it into 'gg-mm-aa - oo.mm'.
+    - If the filename contains a custom title (e.g. 'EGI', 'EGI 12 novembre', 'Lezione'), it preserves the custom title.
+    - Generic voice recorder words (e.g. 'registratore', 'recording', 'audio', 'voice', 'rec', 'memo') are stripped.
     """
     stem = p_in.stem
     prefix = "Trascrizione" if lang == "it" else "Transcription"
 
-    # 1. Match YYYYMMDD_HHMM or YYYY-MM-DD HH-MM
+    # 1. Match YYYYMMDD_HHMM or YYYY-MM-DD-HHMM or YYYYMMDD-HHMM
     m1 = re.search(r"(20\d{2})[-_.]?(\d{2})[-_.]?(\d{2})[-_ ]+(\d{2})[-_.]?(\d{2})", stem)
     # 2. Match DD-MM-YYYY HH:MM or DD-MM-YY HH:MM (Italian/European format)
     m2 = re.search(r"(\d{2})[-_.](\d{2})[-_.](20\d{2}|\d{2})[-_ ]+(\d{2})[-_.](\d{2})", stem)
 
+    matched_span = None
+    formatted_date = None
+
     if m1:
+        matched_span = m1.span()
         anno_full, mese, giorno, ora, minuti = m1.groups()
         anno_breve = anno_full[-2:]
-        nuovo_nome = f"{prefix} {giorno}-{mese}-{anno_breve} - {ora}.{minuti}.{fmt}"
+        formatted_date = f"{giorno}-{mese}-{anno_breve} - {ora}.{minuti}"
     elif m2:
+        matched_span = m2.span()
         giorno, mese, anno_raw, ora, minuti = m2.groups()
         anno_breve = anno_raw[-2:]
-        nuovo_nome = f"{prefix} {giorno}-{mese}-{anno_breve} - {ora}.{minuti}.{fmt}"
+        formatted_date = f"{giorno}-{mese}-{anno_breve} - {ora}.{minuti}"
+
+    if formatted_date:
+        start, end = matched_span
+        rest = (stem[:start] + " " + stem[end:]).strip()
+
+        # Remove generic recorder keywords from rest
+        generic_pattern = r"(?i)(?:^|[\s_.-])(?:registratore|registrazione|recording|audio|voice|vocale|rec|memo|nuova registrazione|new recording)(?:$|[\s_.-])"
+        prev = None
+        cleaned = rest
+        while prev != cleaned:
+            prev = cleaned
+            cleaned = re.sub(generic_pattern, " ", cleaned).strip()
+
+        cleaned = re.sub(r"[-_ ]+", " ", cleaned).strip(" -_")
+
+        if cleaned:
+            # Preserves user custom title (e.g. "EGI") together with the formatted date
+            nuovo_nome = f"{prefix} {cleaned} - {formatted_date}"
+        else:
+            # Entirely generic recorder filename (e.g. "20261012_1530_audio")
+            nuovo_nome = f"{prefix} {formatted_date}"
     else:
-        # Match standard recording names (e.g. 'Registratore vocale 01')
-        pulito = re.sub(r"(?i)^(?:registratore|registrazione|recording)\s*[-_]?\s*", "", stem).strip(" -_")
+        # No recognized timestamp, e.g. "EGI 12 novembre", "pipoz"
+        # Clean leading generic recorder prefixes, preserving custom names
+        pulito = re.sub(r"(?i)^(?:registratore|registrazione|recording|nuova registrazione|new recording)\s*[-_]?\s*", "", stem).strip(" -_")
         if not pulito:
             try:
                 import datetime
                 dt = datetime.datetime.fromtimestamp(p_in.stat().st_mtime)
                 date_str = dt.strftime("%d-%m-%y - %H.%M")
-                nuovo_nome = f"{prefix} {date_str}.{fmt}"
+                nuovo_nome = f"{prefix} {date_str}"
             except Exception:
-                nuovo_nome = f"{prefix} {stem}.{fmt}"
+                nuovo_nome = f"{prefix} {stem}"
         else:
-            nuovo_nome = f"{prefix} {pulito}.{fmt}"
+            nuovo_nome = f"{prefix} {pulito}"
 
-    candidate = p_in.with_name(nuovo_nome)
-    base_out_stem = candidate.stem
+    nuovo_nome = re.sub(r" +", " ", nuovo_nome).strip()
+    return nuovo_nome
+
+def resolve_unique_output_paths(p_in: Path, target_dir: Path, formats: list, lang: str = "it", session_reserved: set = None) -> dict:
+    """
+    Risolve percorsi di output univoci per i formati richiesti (es. txt, docx).
+    Se un file esiste già nella destinazione o è già stato riservato nella sessione corrente,
+    aggiunge un suffisso progressivo ' (2)', ' (3)' condiviso da entrambi i formati.
+    Ritorna un dizionario: { 'txt': Path, 'docx': Path }
+    """
+    base_stem = generate_output_base_stem(p_in, lang=lang)
+    target_dir = Path(target_dir).resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+
     counter = 1
-    while candidate.exists():
-        candidate = p_in.with_name(f"{base_out_stem} ({counter}).{fmt}")
+    while True:
+        stem_candidate = base_stem if counter == 1 else f"{base_stem} ({counter})"
+        collision = False
+        candidates = {}
+        for fmt in formats:
+            cand = target_dir / f"{stem_candidate}.{fmt}"
+            candidates[fmt] = cand
+            if cand.exists():
+                collision = True
+                break
+            if session_reserved is not None and str(cand.resolve()) in session_reserved:
+                collision = True
+                break
+
+        if not collision:
+            if session_reserved is not None:
+                for cand in candidates.values():
+                    session_reserved.add(str(cand.resolve()))
+            return candidates
+
         counter += 1
-    return candidate
+
+def generate_output_path(p_in: Path, fmt: str, lang: str = "it") -> Path:
+    """Helper di compatibilità per ottenere il percorso accanto al file sorgente."""
+    resolved = resolve_unique_output_paths(p_in, p_in.parent, [fmt], lang=lang)
+    return resolved[fmt]
 
 def safe_save_transcription(p_target: Path, fmt: str, paragrafi: list, testo_completo: str) -> Path:
     """
@@ -466,59 +547,65 @@ def detect_system_language() -> str:
 # ==============================================================================
 STRINGS = {
     "it": {
-        "win_title": "Whisper Studio v2.7.5",
-        "sub_edition": "Versione 2.7.5",
-        "hw_label_cuda": "⚡ NVIDIA CUDA • GPU Accelerata",
-        "hw_label_cpu": "💻 Intel / AMD • CPU Multithread",
-        "mem_vram_label": "🧠 VRAM GPU: {used:.1f} GB / {total:.0f} GB in uso",
-        "mem_ram_label": "🧠 Memoria RAM: {used:.1f} GB / {total:.0f} GB in uso",
+        "win_title": "Whisper Studio v3.0.5",
+        "sub_edition": "Versione 3.0.5 • PyQt6",
+        "hw_label_cuda": "NVIDIA CUDA • GPU Accelerata",
+        "hw_label_cpu": "Intel / AMD • CPU Multithread",
+        "mem_vram_label": "VRAM: {used:.1f} / {total:.0f} GB",
+        "mem_ram_label": "RAM: {used:.1f} / {total:.0f} GB",
         "section_model": "MODELLO DI TRASCRIZIONE",
+        "seg_mode_auto": "✨ Automatica",
+        "seg_mode_manual": "🎛️ Manuale",
         "auto_tag": "🤖 Modalità Automatica Attiva",
-        "model_large_title": "💎 Alta Fedeltà (Large-v3 Standard)",
-        "model_turbo_title": "⚡ Alta Velocità (Turbo)",
+        "model_large_title": "Alta Fedeltà (Large-v3 Standard)",
+        "model_turbo_title": "Alta Velocità (Turbo)",
         "auto_desc_large_gpu": "Rilevata GPU NVIDIA • Massima accuratezza GPU",
         "auto_desc_turbo_gpu": "Rilevata GPU NVIDIA • Velocità e VRAM ottimizzate",
         "auto_desc_large_cpu": "GPU NVIDIA non rilevata • Massima accuratezza CPU",
         "auto_desc_turbo_cpu": "GPU NVIDIA non rilevata • Velocità e memoria ottimizzate",
-        "btn_switch_manual": "⚙️ Passa a Selezione Manuale",
         "manual_tag": "⚙️ Selezione Manuale",
-        "btn_large": "💎 Alta Fedeltà\nLarge-v3 Standard (Accuratezza)",
-        "btn_small": "⚡ Alta Velocità\nTurbo (Super Rapido)",
-        "btn_return_auto": "🔄 Ripristina Modalità Automatica",
+        "btn_large": "💎 Alta Fedeltà — Large-v3\nMassima accuratezza e fedeltà acustica",
+        "btn_small": "⚡ Alta Velocità — Turbo\nOttimizzato per rapidità e minor memoria",
         "warn_large_low_spec": "⚠️ Attenzione: GPU NVIDIA non rilevata. Large-v3 Standard potrebbe rallentare l'elaborazione sulla CPU.",
         "warn_turbo_low_spec": "⚡ Consigliato per il tuo PC (GPU NVIDIA non rilevata): il modello Turbo è fluido e velocissimo.",
         "warn_large_high_spec": "💎 Consigliato per il tuo PC (GPU NVIDIA): massima precisione e fedeltà.",
         "warn_turbo_high_spec": "⚠️ Attenzione: la modalità Turbo è velocissima ma leggermente meno accurata rispetto a Large-v3.",
         "section_lang": "LINGUA AUDIO",
-        "btn_lang_primary": "🇮🇹 Italiano",
+        "btn_lang_primary": "Italiano",
         "btn_lang_auto": "🌐 Rileva Auto",
         "lang_subtitle": "Riconoscimento accenti e punteggiatura naturale",
         "section_formats": "FORMATI DI ESPORTAZIONE",
         "chk_txt": "File di Testo (.txt)",
         "chk_docx": "Documento Word (.docx)",
-        "formats_subtitle": "Salvataggio automatico con data nella stessa cartella.",
-        "footer": "🔒 100% Offline • Nessun dato inviato online",
+        "formats_subtitle": "Salvataggio automatico senza sovrascrivere i file esistenti.",
+        "footer": "🔒 Trascrizione 100% Locale",
         "queue_title": "<b>Coda Trascrizioni</b> <span style='color:#818cf8;'>({count})</span>",
-        "btn_add": "➕ Aggiungi File",
-        "btn_clear": "🗑 Svuota Coda",
+        "btn_add": "+  Aggiungi File",
+        "btn_clear": "Svuota Coda",
         "empty_title": "<b>Trascina qui i tuoi file audio o video</b>",
-        "empty_subtitle": "oppure clicca su '➕ Aggiungi File' in alto\nSupporta MP3, M4A, WAV, MP4, MOV, MKV, FLAC, OPUS...",
-        "status_ready": "Pronto. Trascina i file nella coda o clicca su '➕ Aggiungi File'.",
+        "empty_subtitle": "oppure clicca su \"Aggiungi File\" in alto\nSupporta MP3, M4A, WAV, MP4, MOV, MKV, FLAC, OPUS...",
+        "status_ready": "Pronto. Trascina i file nella coda o clicca su \"Aggiungi File\".",
         "status_loading_model": "⏳ Caricamento modello in corso: attendere...",
         "status_downloading": "⏳ Download del modello AI in corso da Hugging Face...",
+        "status_download_paused": "⏸ Download in pausa (avanzamento salvato).",
+        "status_download_cancelled": "Download annullato • File temporanei rimossi.",
+        "status_download_done": "✅ Modello scaricato e pronto per la trascrizione.",
         "status_paused": "⏸ Trascrizione in pausa.",
         "status_resumed": "▶ Trascrizione ripresa.",
         "status_cancelling": "Arresto in corso • Liberazione memoria...",
-        "btn_cancel": "■ ANNULLA",
-        "btn_pause": "⏸ PAUSA",
-        "btn_resume": "▶ RIPRENDI",
-        "btn_start": "🚀 AVVIA TRASCRIZIONE",
+        "btn_cancel": "Annulla",
+        "btn_cancel_download": "Annulla download",
+        "btn_pause_download": "Pausa download",
+        "btn_download_model": "Scarica modello",
+        "btn_pause": "Pausa",
+        "btn_resume": "Riprendi",
+        "btn_start": "Avvia Trascrizione",
         "card_waiting": "⏸ In attesa",
         "card_completed": "✅ Completato",
         "card_error": "❌ Errore",
         "card_done": "Pronto",
         "card_failed": "Fallito",
-        "card_elapsed": "⏱️ {elapsed} trascorsi • ~{rem}",
+        "card_elapsed": "⏱ {elapsed}   ⏳ ~{rem}",
         "dlg_empty_title": "Coda vuota",
         "dlg_empty_msg": "Aggiungi almeno un file audio o video da trascrivere.",
         "dlg_formats_title": "Formati",
@@ -531,78 +618,109 @@ STRINGS = {
         "dlg_manual_cancel": "Annulla",
         "dlg_manual_confirm": "Passa a Manuale",
         "file_dialog_title": "Seleziona file audio o video da trascrivere",
-        "file_dialog_filter": "File Multimediali (*.mp3 *.m4a *.wav *.mp4 *.mov *.mkv *.aac *.ogg *.webm *.flac *.opus *.alac *.wma);;Tutti i file (*.*)",
+        "file_dialog_filter": "File Multimediali (*.mp3 *.m4a *.wav *.mp4 *.mov *.mkv *.aac *.ogg *.webm *.flac *.opus *.alac *.wma *.aiff);;Tutti i file (*.*)",
         "menu_language": "Lingua",
+        "menu_settings": "Impostazioni",
+        "sett_auto_updates": "Controlla automaticamente gli aggiornamenti",
+        "sett_remember_engine": "Ricorda l'ultima modalità del motore",
+        "sett_dest_header": "Salva trascrizioni in",
+        "sett_dest_source": "Accanto al file originale",
+        "sett_dest_custom": "Cartella personalizzata…",
+        "sett_dest_ask": "Chiedi ogni volta",
+        "dlg_choose_dest_title": "Scegli la cartella di destinazione delle trascrizioni",
+        "err_dest_invalid_title": "Cartella di Destinazione Non Valida",
+        "err_dest_invalid_msg": "La cartella personalizzata selezionata non esiste o non è accessibile in scrittura:\n{path}\n\nSeleziona una cartella valida dal menu Impostazioni prima di avviare la trascrizione.",
         "menu_help": "Aiuto",
         "menu_guide": "Guida di Whisper Studio",
+        "menu_check_updates": "Verifica Aggiornamenti...",
         "menu_open_logs": "Apri Cartella Log",
         "menu_about": "Informazioni su Whisper Studio",
-        "help_title": "Guida & Istruzioni — Whisper Studio v2.7.5 (Windows)",
+        "help_title": "Guida & Istruzioni — Whisper Studio v3.0.5 (Windows)",
         "help_close": "Chiudi",
+        "update_dlg_title": "Aggiornamento Disponibile — Whisper Studio",
+        "update_available_header": "È disponibile una nuova versione!",
+        "update_current_ver": "Versione installata: <b>v{current}</b>",
+        "update_new_ver": "Nuova versione: <b style='color: #10b981;'>{new}</b>",
+        "update_changelog_title": "Note di rilascio & novità:",
+        "btn_download_update": "⬇️ Scarica Aggiornamento",
+        "btn_update_later": "Più tardi",
+        "btn_skip_version": "Ignora questa versione",
+        "update_checking_title": "Verifica Aggiornamenti",
+        "update_checking_msg": "Verifica della disponibilità di aggiornamenti in corso...",
+        "update_up_to_date_title": "Nessun Aggiornamento",
+        "update_up_to_date_msg": "Whisper Studio è già aggiornato alla versione più recente (v{version}).",
+        "update_error_title": "Errore Verifica Aggiornamenti",
+        "update_error_msg": "Impossibile verificare gli aggiornamenti su GitHub.\nControlla la tua connessione internet o riprova più tardi.\n\nDettagli: {err}",
         "notif_completed": "Trascrizione completata ({count} file)!",
-        "progress_total": "Avanzamento Totale: {perc}% (File {curr} di {total}) | ⏱️ {elapsed} trascorsi • rimasti ~{rem}",
+        "progress_total": "Avanzamento: {perc}% (File {curr}/{total})   ⏱ {elapsed}   ⏳ ~{rem}",
         "finished_msg": "✨ Trascrizione completata: {count} file elaborati con successo • Memoria liberata.",
         "cancelled_msg": "Operazione interrotta • Memoria RAM e VRAM liberate.",
         "about_title": "Informazioni — Whisper Studio",
-        "about_text": "<b>Whisper Studio — Edizione Windows v2.7.5</b><br><br>"
+        "about_text": "<b>Whisper Studio — Edizione Windows v3.0.5</b><br><br>"
                       "Sviluppato con interfaccia grafica moderna PyQt6 e motore Faster-Whisper.<br>"
                       "Ottimizzato per GPU NVIDIA (CUDA) e CPU Intel/AMD.<br><br>"
                       "<i>100% Offline • Riservatezza Totale • Nessun dato inviato online.</i>"
     },
     "en": {
-        "win_title": "Whisper Studio v2.7.5",
-        "sub_edition": "Version 2.7.5",
-        "hw_label_cuda": "⚡ NVIDIA CUDA • GPU Accelerated",
-        "hw_label_cpu": "💻 Intel / AMD • CPU Multithread",
-        "mem_vram_label": "🧠 GPU VRAM: {used:.1f} GB / {total:.0f} GB in use",
-        "mem_ram_label": "🧠 System RAM: {used:.1f} GB / {total:.0f} GB in use",
+        "win_title": "Whisper Studio v3.0.5",
+        "sub_edition": "Version 3.0.5 • PyQt6",
+        "hw_label_cuda": "NVIDIA CUDA • GPU Accelerated",
+        "hw_label_cpu": "Intel / AMD • CPU Multithread",
+        "mem_vram_label": "VRAM: {used:.1f} / {total:.0f} GB",
+        "mem_ram_label": "RAM: {used:.1f} / {total:.0f} GB",
         "section_model": "TRANSCRIPTION MODEL",
+        "seg_mode_auto": "✨ Automatic",
+        "seg_mode_manual": "🎛️ Manual",
         "auto_tag": "🤖 Automatic Mode Active",
-        "model_large_title": "💎 High Fidelity (Large-v3 Standard)",
-        "model_turbo_title": "⚡ High Speed (Turbo)",
+        "model_large_title": "High Fidelity (Large-v3 Standard)",
+        "model_turbo_title": "High Speed (Turbo)",
         "auto_desc_large_gpu": "NVIDIA GPU detected • Maximum GPU accuracy",
         "auto_desc_turbo_gpu": "NVIDIA GPU detected • Optimized speed and VRAM",
         "auto_desc_large_cpu": "No NVIDIA GPU detected • Maximum CPU accuracy",
         "auto_desc_turbo_cpu": "No NVIDIA GPU detected • Optimized speed and memory",
-        "btn_switch_manual": "⚙️ Switch to Manual Selection",
         "manual_tag": "⚙️ Manual Selection",
-        "btn_large": "💎 High Fidelity\nLarge-v3 Standard (Accuracy)",
-        "btn_small": "⚡ High Speed\nTurbo (Super Fast)",
-        "btn_return_auto": "🔄 Restore Automatic Mode",
+        "btn_large": "💎 High Fidelity — Large-v3\nMaximum accuracy & acoustic fidelity",
+        "btn_small": "⚡ High Speed — Turbo\nOptimized for speed & lower memory",
         "warn_large_low_spec": "⚠️ Warning: No NVIDIA GPU detected. Large-v3 Standard may slow down processing on CPU.",
         "warn_turbo_low_spec": "⚡ Recommended for your PC (no NVIDIA GPU): Turbo model is fluid and lightning-fast.",
         "warn_large_high_spec": "💎 Recommended for your PC (NVIDIA GPU): maximum precision and fidelity.",
         "warn_turbo_high_spec": "⚠️ Note: Turbo mode is very fast but slightly less accurate than Large-v3.",
         "section_lang": "AUDIO LANGUAGE",
-        "btn_lang_primary": "🇬🇧 English",
+        "btn_lang_primary": "English",
         "btn_lang_auto": "🌐 Auto Detect",
         "lang_subtitle": "Natural accents and punctuation recognition",
         "section_formats": "EXPORT FORMATS",
         "chk_txt": "Text File (.txt)",
         "chk_docx": "Word Document (.docx)",
-        "formats_subtitle": "Automatically saved next to source audio files.",
-        "footer": "🔒 100% Offline • No data sent online",
+        "formats_subtitle": "Safe saving without overwriting existing files.",
+        "footer": "🔒 100% Local Transcription",
         "queue_title": "<b>Transcription Queue</b> <span style='color:#818cf8;'>({count})</span>",
-        "btn_add": "➕ Add Files",
-        "btn_clear": "🗑 Clear Queue",
+        "btn_add": "+  Add Files",
+        "btn_clear": "Clear Queue",
         "empty_title": "<b>Drag and drop your audio or video files here</b>",
-        "empty_subtitle": "or click '➕ Add Files' above\nSupports MP3, M4A, WAV, MP4, MOV, MKV, FLAC, OPUS...",
-        "status_ready": "Ready. Drag files into queue or click '➕ Add Files'.",
+        "empty_subtitle": "or click \"Add Files\" above\nSupports MP3, M4A, WAV, MP4, MOV, MKV, FLAC, OPUS...",
+        "status_ready": "Ready. Drag files into queue or click \"Add Files\".",
         "status_loading_model": "⏳ Loading model: please wait...",
         "status_downloading": "⏳ Downloading AI model from Hugging Face...",
+        "status_download_paused": "⏸ Download paused (progress saved).",
+        "status_download_cancelled": "Download cancelled • Temporary files removed.",
+        "status_download_done": "✅ Model downloaded and ready for transcription.",
         "status_paused": "⏸ Transcription paused.",
         "status_resumed": "▶ Transcription resumed.",
         "status_cancelling": "Stopping transcription • Releasing memory...",
-        "btn_cancel": "■ CANCEL",
-        "btn_pause": "⏸ PAUSE",
-        "btn_resume": "▶ RESUME",
-        "btn_start": "🚀 START TRANSCRIPTION",
+        "btn_cancel": "Cancel",
+        "btn_cancel_download": "Cancel download",
+        "btn_pause_download": "Pause download",
+        "btn_download_model": "Download model",
+        "btn_pause": "Pause",
+        "btn_resume": "Resume",
+        "btn_start": "Start Transcription",
         "card_waiting": "⏸ Waiting",
         "card_completed": "✅ Completed",
         "card_error": "❌ Error",
         "card_done": "Done",
         "card_failed": "Failed",
-        "card_elapsed": "⏱️ {elapsed} elapsed • ~{rem}",
+        "card_elapsed": "⏱ {elapsed}   ⏳ ~{rem}",
         "dlg_empty_title": "Empty Queue",
         "dlg_empty_msg": "Please add at least one audio or video file to transcribe.",
         "dlg_formats_title": "Formats",
@@ -615,20 +733,45 @@ STRINGS = {
         "dlg_manual_cancel": "Cancel",
         "dlg_manual_confirm": "Switch to Manual",
         "file_dialog_title": "Select audio or video files to transcribe",
-        "file_dialog_filter": "Media Files (*.mp3 *.m4a *.wav *.mp4 *.mov *.mkv *.aac *.ogg *.webm *.flac *.opus *.alac *.wma);;All Files (*.*)",
+        "file_dialog_filter": "Media Files (*.mp3 *.m4a *.wav *.mp4 *.mov *.mkv *.aac *.ogg *.webm *.flac *.opus *.alac *.wma *.aiff);;All Files (*.*)",
         "menu_language": "Language",
+        "menu_settings": "Settings",
+        "sett_auto_updates": "Automatically check for updates",
+        "sett_remember_engine": "Remember last engine mode",
+        "sett_dest_header": "Save transcriptions to",
+        "sett_dest_source": "Next to original file",
+        "sett_dest_custom": "Custom folder…",
+        "sett_dest_ask": "Ask every time",
+        "dlg_choose_dest_title": "Choose transcription destination folder",
+        "err_dest_invalid_title": "Invalid Destination Folder",
+        "err_dest_invalid_msg": "The selected custom folder does not exist or is not writable:\n{path}\n\nPlease choose a valid folder from the Settings menu before starting transcription.",
         "menu_help": "Help",
         "menu_guide": "Whisper Studio Guide",
+        "menu_check_updates": "Check for Updates...",
         "menu_open_logs": "Open Log Folder",
         "menu_about": "About Whisper Studio",
-        "help_title": "User Guide — Whisper Studio v2.7.5 (Windows)",
+        "help_title": "User Guide — Whisper Studio v3.0.5 (Windows)",
         "help_close": "Close",
+        "update_dlg_title": "Update Available — Whisper Studio",
+        "update_available_header": "A new version is available!",
+        "update_current_ver": "Installed version: <b>v{current}</b>",
+        "update_new_ver": "New version: <b style='color: #10b981;'>{new}</b>",
+        "update_changelog_title": "Release notes & changes:",
+        "btn_download_update": "⬇️ Download Update",
+        "btn_update_later": "Later",
+        "btn_skip_version": "Skip This Version",
+        "update_checking_title": "Checking for Updates",
+        "update_checking_msg": "Checking GitHub for available updates...",
+        "update_up_to_date_title": "Up to Date",
+        "update_up_to_date_msg": "Whisper Studio is up to date (v{version}).",
+        "update_error_title": "Update Check Failed",
+        "update_error_msg": "Could not check for updates on GitHub.\nPlease verify your internet connection or try again later.\n\nDetails: {err}",
         "notif_completed": "Transcription completed ({count} files)!",
-        "progress_total": "Total Progress: {perc}% (File {curr} of {total}) | ⏱️ {elapsed} elapsed • ~{rem} remaining",
+        "progress_total": "Progress: {perc}% (File {curr}/{total})   ⏱ {elapsed}   ⏳ ~{rem}",
         "finished_msg": "✨ Transcription completed: {count} files processed successfully • Memory reclaimed.",
         "cancelled_msg": "Operation cancelled • RAM and VRAM reclaimed.",
         "about_title": "About — Whisper Studio",
-        "about_text": "<b>Whisper Studio — Windows Edition v2.7.5</b><br><br>"
+        "about_text": "<b>Whisper Studio — Windows Edition v3.0.5</b><br><br>"
                       "Built with a sleek PyQt6 modern dark interface and the Faster-Whisper neural engine.<br>"
                       "Optimized for NVIDIA GPUs (CUDA) and Intel/AMD CPUs.<br><br>"
                       "<i>100% Offline • Zero Telemetry • Completely Private.</i>"
@@ -860,7 +1003,41 @@ def find_local_model_path(model_id: str) -> str:
     return ""
 
 
-def download_model_safely(model_name: str, callback_progresso=None, is_aborted=None, lang: str = "it") -> str:
+def _resolve_model_repo_and_slug(model_name: str):
+    if model_name in ("turbo", "large-v3-turbo"):
+        return "mobiuslabsgmbh/faster-whisper-large-v3-turbo", "faster-whisper-large-v3-turbo"
+    elif "/" in model_name:
+        return model_name, model_name.split("/")[-1]
+    elif model_name.startswith("faster-whisper-"):
+        return f"Systran/{model_name}", model_name
+    return f"Systran/faster-whisper-{model_name}", f"faster-whisper-{model_name}"
+
+
+def is_model_cached(model_name: str) -> bool:
+    """Restituisce True se il modello selezionato è già presente e completo nella cache locale."""
+    local_p = find_local_model_path(model_name)
+    return bool(local_p and is_model_dir_complete(Path(local_p)))
+
+
+def cleanup_partial_model_download(model_name: str):
+    """Elimina i file .part e l'eventuale cartella di download incompleta dalla cache."""
+    _, folder_slug = _resolve_model_repo_and_slug(model_name)
+    dest_dir = BASE_DIR / "models" / folder_slug
+    if not dest_dir.exists() or is_model_dir_complete(dest_dir):
+        return
+    try:
+        for part_f in dest_dir.glob("*.part"):
+            part_f.unlink(missing_ok=True)
+    except Exception:
+        pass
+    try:
+        if not is_model_dir_complete(dest_dir):
+            shutil.rmtree(dest_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def download_model_safely(model_name: str, callback_progresso=None, is_aborted=None, should_delete_partial=None, lang: str = "it") -> str:
     """
     Downloads model directly from HuggingFace using standard urllib with Range resume support,
     without symlinks, hardlinks, file locks, or ctypes Win32 calls.
@@ -871,30 +1048,18 @@ def download_model_safely(model_name: str, callback_progresso=None, is_aborted=N
     import time
     import socket
 
-    socket.setdefaulttimeout(300)
-    os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "300"
-    os.environ["HF_HUB_ETAG_TIMEOUT"] = "60"
+    socket.setdefaulttimeout(30)
+    os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "30"
+    os.environ["HF_HUB_ETAG_TIMEOUT"] = "30"
 
     WEIGHT_FILE_NAMES = ("model.bin", "model.safetensors", "weights.safetensors", "weights.npz")
-
-    if model_name in ("turbo", "large-v3-turbo"):
-        repo_id = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
-        folder_slug = "faster-whisper-large-v3-turbo"
-    elif "/" in model_name:
-        repo_id = model_name
-        folder_slug = model_name.split("/")[-1]
-    elif model_name.startswith("faster-whisper-"):
-        repo_id = f"Systran/{model_name}"
-        folder_slug = model_name
-    else:
-        repo_id = f"Systran/faster-whisper-{model_name}"
-        folder_slug = f"faster-whisper-{model_name}"
+    repo_id, folder_slug = _resolve_model_repo_and_slug(model_name)
 
     dest_dir = BASE_DIR / "models" / folder_slug
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     headers = {
-        "User-Agent": "WhisperStudio/2.7.5 (Windows NT 10.0; Win64; x64)"
+        "User-Agent": f"WhisperStudio/{APP_VERSION} (Windows NT 10.0; Win64; x64)"
     }
 
     # Phase 1: Notify initialization
@@ -903,6 +1068,8 @@ def download_model_safely(model_name: str, callback_progresso=None, is_aborted=N
         callback_progresso(0.0, msg_init)
 
     if is_aborted and is_aborted():
+        if should_delete_partial and should_delete_partial():
+            cleanup_partial_model_download(model_name)
         return ""
 
     # Fetch file list and sizes from HF tree API
@@ -910,7 +1077,7 @@ def download_model_safely(model_name: str, callback_progresso=None, is_aborted=N
     tree_url = f"https://huggingface.co/api/models/{repo_id}/tree/main"
     try:
         req = urllib.request.Request(tree_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             items = json.loads(resp.read().decode("utf-8"))
             for it in items:
                 fname = it.get("path", "")
@@ -942,6 +1109,8 @@ def download_model_safely(model_name: str, callback_progresso=None, is_aborted=N
 
     for fname, expected_size in files_to_download:
         if is_aborted and is_aborted():
+            if should_delete_partial and should_delete_partial():
+                cleanup_partial_model_download(model_name)
             return ""
 
         file_dest = dest_dir / fname
@@ -982,7 +1151,7 @@ def download_model_safely(model_name: str, callback_progresso=None, is_aborted=N
 
         try:
             req = urllib.request.Request(file_url, headers=req_headers)
-            with urllib.request.urlopen(req, timeout=300) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 is_resumed = (resp.status == 206)
                 if part_offset > 0 and not is_resumed:
                     # Server did not honor Range, rollback downloaded bytes counter
@@ -1006,7 +1175,8 @@ def download_model_safely(model_name: str, callback_progresso=None, is_aborted=N
                     while True:
                         if is_aborted and is_aborted():
                             out_f.close()
-                            # Do NOT delete part_dest on user abort so it can resume cleanly
+                            if should_delete_partial and should_delete_partial():
+                                cleanup_partial_model_download(model_name)
                             return ""
 
                         chunk = resp.read(chunk_size)
@@ -1034,24 +1204,24 @@ def download_model_safely(model_name: str, callback_progresso=None, is_aborted=N
                                 elapsed_tot = max(0.001, now - t_start)
                                 smoothed_speed_bps = network_bytes_session / elapsed_tot
 
-                            speed_mb_s = smoothed_speed_bps / (1024 * 1024)
-                            speed_mbps = speed_mb_s * 8.0
+                            # Velocità decimale MB/s (1_000_000) e MB scaricati/totali
+                            speed_mb_s = smoothed_speed_bps / 1_000_000.0
 
                             if total_bytes_expected > 0:
                                 perc = min(99.0, (total_downloaded_bytes / total_bytes_expected) * 100.0)
-                                cur_mb = total_downloaded_bytes / (1024 * 1024)
-                                tot_mb = total_bytes_expected / (1024 * 1024)
+                                cur_mb = total_downloaded_bytes / 1_000_000.0
+                                tot_mb = total_bytes_expected / 1_000_000.0
                                 if lang == "it":
-                                    msg = f"Download modello: {int(perc)}% • {speed_mbps:.1f} Mbps ({speed_mb_s:.1f} MB/s) • {cur_mb:.0f}/{tot_mb:.0f} MB"
+                                    msg = f"Download modello: {int(perc)}% • {speed_mb_s:.1f} MB/s • {cur_mb:.0f}/{tot_mb:.0f} MB"
                                 else:
-                                    msg = f"Downloading model: {int(perc)}% • {speed_mbps:.1f} Mbps ({speed_mb_s:.1f} MB/s) • {cur_mb:.0f}/{tot_mb:.0f} MB"
+                                    msg = f"Downloading model: {int(perc)}% • {speed_mb_s:.1f} MB/s • {cur_mb:.0f}/{tot_mb:.0f} MB"
                             else:
-                                cur_mb = total_downloaded_bytes / (1024 * 1024)
+                                cur_mb = total_downloaded_bytes / 1_000_000.0
                                 perc = 50.0
                                 if lang == "it":
-                                    msg = f"Download modello in corso • {speed_mbps:.1f} Mbps ({speed_mb_s:.1f} MB/s) • {cur_mb:.0f} MB"
+                                    msg = f"Download modello in corso • {speed_mb_s:.1f} MB/s • {cur_mb:.0f} MB"
                                 else:
-                                    msg = f"Downloading model • {speed_mbps:.1f} Mbps ({speed_mb_s:.1f} MB/s) • {cur_mb:.0f} MB"
+                                    msg = f"Downloading model • {speed_mb_s:.1f} MB/s • {cur_mb:.0f} MB"
 
                             if callback_progresso:
                                 callback_progresso(perc / 100.0, msg)
@@ -1094,7 +1264,7 @@ def download_model_safely(model_name: str, callback_progresso=None, is_aborted=N
     return str(dest_dir.resolve())
 
 
-def check_or_download_model(model_name: str, callback_progresso=None, is_aborted=None, lang: str = "it") -> str:
+def check_or_download_model(model_name: str, callback_progresso=None, is_aborted=None, should_delete_partial=None, lang: str = "it") -> str:
     """
     Validates model availability. If absent or incomplete, downloads model files directly and safely
     via standard HTTPS streaming with Range resume into models/ without symlinks, locks, or exploit-like calls.
@@ -1104,7 +1274,13 @@ def check_or_download_model(model_name: str, callback_progresso=None, is_aborted
     if local and is_model_dir_complete(Path(local)):
         return local
 
-    downloaded = download_model_safely(model_name, callback_progresso=callback_progresso, is_aborted=is_aborted, lang=lang)
+    downloaded = download_model_safely(
+        model_name,
+        callback_progresso=callback_progresso,
+        is_aborted=is_aborted,
+        should_delete_partial=should_delete_partial,
+        lang=lang
+    )
     if downloaded and is_model_dir_complete(Path(downloaded)):
         return downloaded
 
@@ -1158,13 +1334,36 @@ QMenu::item:selected {
 }
 QFrame#sidebarFrame {
     background-color: #18181b;
-    border-radius: 14px;
-    border: 1px solid #27272a;
+    border: none;
+    border-right: 1px solid #27272a;
+}
+QFrame#sidebarFooter {
+    background: transparent;
+    border: none;
+    border-top: 1px solid #27272a;
 }
 QFrame#rightPanel {
+    background-color: #121214;
+    border: none;
+}
+QFrame#queueHeader {
+    background-color: #18181b;
+    border: none;
+    border-bottom: 1px solid #27272a;
+}
+QFrame#contentArea {
+    background-color: #121214;
+    border: none;
+}
+QFrame#bottomDock {
+    background-color: #18181b;
+    border: none;
+    border-top: 1px solid #27272a;
+}
+QFrame#ramCard, QFrame#formatsCard {
     background-color: #161618;
-    border-radius: 14px;
     border: 1px solid #27272a;
+    border-radius: 12px;
 }
 
 /* Schede della coda per stato */
@@ -1195,10 +1394,9 @@ QFrame#emptyCard {
 }
 
 QLabel#titleLabel {
-    font-size: 18px;
-    font-weight: 800;
+    font-size: 15px;
+    font-weight: 700;
     color: #ffffff;
-    letter-spacing: 0.5px;
 }
 QLabel#subLabel {
     font-size: 11px;
@@ -1206,17 +1404,16 @@ QLabel#subLabel {
 }
 QLabel#sectionTitle {
     font-size: 11px;
-    font-weight: 700;
+    font-weight: 600;
     color: #a1a1aa;
-    text-transform: uppercase;
     letter-spacing: 0.5px;
 }
 
 /* Pulsanti Toggle Modello e Lingua */
 QPushButton.toggleBtn, QPushButton[class="toggleBtn"] {
-    background-color: #222226;
-    border: 1.5px solid #383840;
-    border-radius: 9px;
+    background-color: #1f1f23;
+    border: 1px solid #323238;
+    border-radius: 12px;
     color: #ffffff;
     font-size: 12px;
     font-weight: 600;
@@ -1239,15 +1436,15 @@ QPushButton.toggleBtn:disabled, QPushButton[class="toggleBtn"]:disabled {
 }
 
 QPushButton#btnLargeModello, QPushButton#btnSmallModello {
-    background-color: #222226;
-    border: 1.5px solid #383840;
-    border-radius: 9px;
+    background-color: #1f1f23;
+    border: 1px solid #323238;
+    border-radius: 12px;
     color: #ffffff;
     font-size: 12px;
     font-weight: 600;
     padding: 6px 12px;
     text-align: left;
-    min-height: 44px;
+    min-height: 40px;
 }
 QPushButton#btnLargeModello:hover, QPushButton#btnSmallModello:hover {
     background-color: #2a2a30;
@@ -1295,10 +1492,11 @@ QProgressBar::chunk {
 QPushButton#btnAdd {
     background-color: #818cf8;
     color: #ffffff;
-    border-radius: 8px;
-    font-weight: bold;
+    border-radius: 10px;
+    font-weight: 600;
     font-size: 13px;
-    padding: 7px 14px;
+    padding: 0px 14px;
+    min-height: 32px;
     border: none;
 }
 QPushButton#btnAdd:hover {
@@ -1308,11 +1506,17 @@ QPushButton#btnAdd:hover {
 QPushButton#btnClear {
     background-color: #27272a;
     color: #e4e4e7;
-    border-radius: 8px;
+    border-radius: 10px;
     font-weight: 600;
     font-size: 13px;
-    padding: 7px 14px;
-    border: 1px solid #3f3f46;
+    padding: 0px 14px;
+    min-height: 32px;
+    border: 1px solid #323238;
+}
+QPushButton#btnClear:disabled {
+    background-color: #27272a;
+    color: #71717a;
+    border: 1px solid #27272a;
 }
 QPushButton#btnClear:hover {
     background-color: #ef4444;
@@ -1323,14 +1527,20 @@ QPushButton#btnClear:hover {
 QPushButton#btnAvvia {
     background-color: #10b981;
     color: #ffffff;
-    border-radius: 9px;
+    border-radius: 10px;
     font-size: 14px;
-    font-weight: bold;
+    font-weight: 600;
     border: none;
     min-height: 44px;
 }
 QPushButton#btnAvvia:hover {
     background-color: #059669;
+}
+QPushButton#btnAvvia[downloadMode="true"] {
+    background-color: #818cf8;
+}
+QPushButton#btnAvvia[downloadMode="true"]:hover {
+    background-color: #6d78f5;
 }
 QPushButton#btnAvvia:disabled {
     background-color: #27272a;
@@ -1339,9 +1549,9 @@ QPushButton#btnAvvia:disabled {
 QPushButton#btnPausa {
     background-color: #d97706;
     color: #ffffff;
-    border-radius: 9px;
+    border-radius: 10px;
     font-size: 14px;
-    font-weight: bold;
+    font-weight: 600;
     border: none;
     min-height: 44px;
 }
@@ -1355,9 +1565,9 @@ QPushButton#btnPausa:disabled {
 QPushButton#btnFerma {
     background-color: #ef4444;
     color: #ffffff;
-    border-radius: 9px;
+    border-radius: 10px;
     font-size: 14px;
-    font-weight: bold;
+    font-weight: 600;
     border: none;
     min-height: 44px;
 }
@@ -1403,13 +1613,14 @@ QListWidget::item:selected {
 # ==============================================================================
 class TrascrizioneWorkerThread(QThread):
     file_avviato = pyqtSignal(int, str)
+    download_terminato = pyqtSignal()
     progresso_file = pyqtSignal(int, int, float, float)  # idx, perc, trascorso, rimasto
     progresso_totale = pyqtSignal(int, str)              # perc_tot, text_tot
     file_completato = pyqtSignal(int, str)
     file_errore = pyqtSignal(int, str)
     coda_terminata = pyqtSignal(int, str)
 
-    def __init__(self, coda_files, model_id, lingua_mode, formati, active_device, active_compute, lang="it", queue_lock=None):
+    def __init__(self, coda_files, model_id, lingua_mode, formati, active_device, active_compute, lang="it", queue_lock=None, dest_dir=None):
         super().__init__()
         self.coda_files = coda_files
         self.model_id = model_id
@@ -1419,7 +1630,10 @@ class TrascrizioneWorkerThread(QThread):
         self.active_compute = active_compute
         self.lang = lang
         self.queue_lock = queue_lock or threading.Lock()
+        self.dest_dir = Path(dest_dir).resolve() if dest_dir else None
+        self.session_reserved = set()
         self.abort_requested = False
+        self.delete_partial_on_abort = False
         self.is_paused = False
         self.loaded_model = None
         self.secondi_fatti_fino_a_qui = 0.0
@@ -1480,6 +1694,7 @@ class TrascrizioneWorkerThread(QThread):
                 self.model_id,
                 callback_progresso=cb_dl,
                 is_aborted=lambda: self.abort_requested,
+                should_delete_partial=lambda: self.delete_partial_on_abort,
                 lang=self.lang
             )
         except Exception as e_dl:
@@ -1487,8 +1702,11 @@ class TrascrizioneWorkerThread(QThread):
             self.coda_terminata.emit(0, f"Errore download modello: {e_dl}")
             return
 
-        if self.abort_requested or not model_path_or_id or not is_model_dir_complete(Path(model_path_or_id)):
-            self.coda_terminata.emit(0, "Download annullato o modello incompleto")
+        if self.abort_requested:
+            self.coda_terminata.emit(0, "")
+            return
+        if not model_path_or_id or not is_model_dir_complete(Path(model_path_or_id)):
+            self.coda_terminata.emit(0, "Errore: download annullato o modello incompleto")
             return
 
         # 2. Instantiate Faster-Whisper Model with GPU -> CPU Fallback
@@ -1515,6 +1733,8 @@ class TrascrizioneWorkerThread(QThread):
                 logging.error(f"Errore critico caricamento modello su CPU: {e_cpu}")
                 self.coda_terminata.emit(0, f"Errore caricamento modello: {e_cpu}")
                 return
+
+        self.download_terminato.emit()
 
         start_time_globale = time.time()
         self.start_time_globale = start_time_globale
@@ -1558,6 +1778,9 @@ class TrascrizioneWorkerThread(QThread):
                 transcribe_kwargs = {
                     "beam_size": 5,
                     "condition_on_previous_text": False,
+                    "repetition_penalty": 1.1,
+                    "no_repeat_ngram_size": 4,
+                    "hallucination_silence_threshold": 2.0,
                     "vad_filter": True,
                     "vad_parameters": dict(min_silence_duration_ms=500),
                 }
@@ -1573,6 +1796,7 @@ class TrascrizioneWorkerThread(QThread):
                         paragrafi_inner = []
                         buffer_inner = []
                         ultimo_end_inner = 0.0
+                        last_short_norm = None
 
                         segments, info = self.loaded_model.transcribe(str(p_in), **transcribe_kwargs)
 
@@ -1590,10 +1814,16 @@ class TrascrizioneWorkerThread(QThread):
 
                             t = segment.text.strip()
                             if t:
-                                buffer_inner.append(t)
-                                if len(buffer_inner) >= 4:
-                                    paragrafi_inner.append(" ".join(buffer_inner))
-                                    buffer_inner = []
+                                norm_t = t.lower().strip(".,!?;:…\"'()[]{}")
+                                is_short = len(norm_t.split()) <= 3
+                                if is_short and norm_t and norm_t == last_short_norm:
+                                    pass
+                                else:
+                                    last_short_norm = norm_t if is_short else None
+                                    buffer_inner.append(t)
+                                    if len(buffer_inner) >= 4:
+                                        paragrafi_inner.append(" ".join(buffer_inner))
+                                        buffer_inner = []
 
                             # Timestamp Progress calculation
                             ultimo_end_inner = min(durata_file, max(ultimo_end_inner, segment.end))
@@ -1641,9 +1871,17 @@ class TrascrizioneWorkerThread(QThread):
                         else:
                             raise
 
-                    # Export results with Windows lock protection
+                    # Export results with synchronized progressive naming and Windows lock protection
+                    eff_dest_dir = self.dest_dir if self.dest_dir else p_in.parent
+                    paths_risolti = resolve_unique_output_paths(
+                        p_in=p_in,
+                        target_dir=eff_dest_dir,
+                        formats=self.formati,
+                        lang=self.lang,
+                        session_reserved=self.session_reserved
+                    )
                     for fmt in self.formati:
-                        p_out = generate_output_path(p_in, fmt, lang=self.lang)
+                        p_out = paths_risolti[fmt]
                         safe_save_transcription(p_out, fmt, paragrafi, testo_completo)
 
                     with self.queue_lock:
@@ -1704,21 +1942,72 @@ class TrascrizioneWorkerThread(QThread):
     def riprendi(self):
         self.is_paused = False
 
-    def ferma(self):
+    def ferma(self, delete_partial: bool = False):
+        self.delete_partial_on_abort = bool(delete_partial)
         self.abort_requested = True
         self.is_paused = False
+
+
+class ModelDownloadWorker(QThread):
+    """Thread dedicato al download preliminare del modello (anche a coda vuota), con supporto Pausa/Riprendi e Annulla."""
+    progresso_download = pyqtSignal(int, str)
+    download_completato = pyqtSignal(bool, str)  # success, status_code ("ok", "paused", "cancelled", o messaggio errore)
+
+    def __init__(self, model_id: str, lang: str = "it"):
+        super().__init__()
+        self.model_id = model_id
+        self.lang = lang
+        self.abort_requested = False
+        self.delete_partial = False
+
+    def pausa(self):
+        self.delete_partial = False
+        self.abort_requested = True
+
+    def annulla(self):
+        self.delete_partial = True
+        self.abort_requested = True
+
+    def run(self):
+        def cb_dl(p, txt):
+            perc = int(p * 100) if isinstance(p, float) and p <= 1.0 else int(p)
+            self.progresso_download.emit(perc, txt)
+
+        try:
+            res = check_or_download_model(
+                self.model_id,
+                callback_progresso=cb_dl,
+                is_aborted=lambda: self.abort_requested,
+                should_delete_partial=lambda: self.delete_partial,
+                lang=self.lang
+            )
+            if self.abort_requested:
+                if self.delete_partial:
+                    cleanup_partial_model_download(self.model_id)
+                    self.download_completato.emit(False, "cancelled")
+                else:
+                    self.download_completato.emit(False, "paused")
+                return
+            if res and is_model_dir_complete(Path(res)):
+                self.download_completato.emit(True, "ok")
+            else:
+                self.download_completato.emit(False, "cancelled" if self.delete_partial else "paused")
+        except Exception as e:
+            logging.error(f"Errore download modello standalone: {e}")
+            self.download_completato.emit(False, str(e))
 
 # ==============================================================================
 # LIVE LINEAR MEMORY GAUGE BAR (VRAM / SYSTEM RAM)
 # ==============================================================================
 class RAMGaugeBar(QWidget):
+    """Barra memoria piatta a capsula (tinta in base alla pressione, come macOS)."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(5)
+        self.setFixedHeight(6)
         self._ratio = 0.25
 
     def set_ratio(self, ratio: float):
-        self._ratio = max(0.05, min(1.0, float(ratio)))
+        self._ratio = max(0.0, min(1.0, float(ratio)))
         self.update()
 
     def paintEvent(self, event):
@@ -1737,10 +2026,13 @@ class RAMGaugeBar(QWidget):
             painter.setClipPath(bg)
             fg = QPainterPath()
             fg.addRoundedRect(0.0, 0.0, fill_w, h, r, r)
-            grad = QLinearGradient(0.0, 0.0, w, 0.0)
-            grad.setColorAt(0.0, QColor("#10b981"))
-            grad.setColorAt(1.0, QColor("#818cf8"))
-            painter.fillPath(fg, grad)
+            if self._ratio > 0.85:
+                tint = QColor("#ef4444")
+            elif self._ratio > 0.70:
+                tint = QColor("#f59e0b")
+            else:
+                tint = QColor("#818cf8")
+            painter.fillPath(fg, tint)
         painter.end()
 
 # ==============================================================================
@@ -1813,6 +2105,278 @@ class WindowsCheckBox(QCheckBox):
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
         painter.end()
 
+
+# ==============================================================================
+# APPLE-STYLE SWITCH ROW (36x20 squircle toggle, as in macOS AppleSwitchToggleStyle)
+# ==============================================================================
+class AppleSwitchCheckBox(QCheckBox):
+    def __init__(self, text="", icon_kind="doc", accent=False, parent=None):
+        super().__init__(text, parent)
+        self._icon_kind = icon_kind
+        self._accent = accent
+        self._pos = 0.0
+        self._hovered = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(38)
+        self._anim = QPropertyAnimation(self, b"knobPos", self)
+        self._anim.setDuration(160)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    @pyqtProperty(float)
+    def knobPos(self) -> float:
+        return self._pos
+
+    @knobPos.setter
+    def knobPos(self, val: float):
+        self._pos = float(val)
+        self.update()
+
+    def nextCheckState(self):
+        target = 0.0 if self.isChecked() else 1.0
+        self._anim.stop()
+        self._anim.setStartValue(self._pos)
+        self._anim.setEndValue(target)
+        self._anim.start()
+        super().nextCheckState()
+
+    def hitButton(self, pos: QPoint) -> bool:
+        return self.rect().contains(pos)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        w = float(self.width())
+        h = float(self.height())
+        enabled = self.isEnabled()
+        checked = self.isChecked()
+        pos = self._pos if self._anim.state() == QPropertyAnimation.State.Running else (1.0 if checked else 0.0)
+
+        # Icona documento
+        icol = QColor("#818cf8") if self._accent else QColor("#a1a1aa")
+        if not enabled:
+            icol.setAlpha(110)
+        painter.setPen(QPen(icol, 1.2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        ix, iy = 10.0, (h - 13.0) / 2.0
+        painter.drawRoundedRect(QRectF(ix + 0.6, iy + 0.6, 9.0, 12.0), 2.0, 2.0)
+        lines = 3 if self._accent else 2
+        for i in range(lines):
+            ly = iy + 4.2 + i * 2.8
+            painter.drawLine(QPointF(ix + 3.0, ly), QPointF(ix + 7.2, ly))
+
+        # Testo
+        f = QFont(self.font())
+        f.setPixelSize(13)
+        painter.setFont(f)
+        painter.setPen(QColor("#e4e4e7") if enabled else QColor("#71717a"))
+        painter.drawText(QRectF(ix + 18.0, 0.0, w - 90.0, h),
+                         Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
+
+        # Switch 36x20
+        if not enabled:
+            painter.setOpacity(0.45)
+        sw_w, sw_h = 36.0, 20.0
+        sx = w - 10.0 - sw_w
+        sy = (h - sw_h) / 2.0
+        track = QPainterPath()
+        track.addRoundedRect(QRectF(sx + 0.5, sy + 0.5, sw_w - 1.0, sw_h - 1.0), 10.0, 10.0)
+        t = pos
+        def mix(c0, c1):
+            return int(c0 + (c1 - c0) * t)
+        fill = QColor(mix(0x22, 0x81), mix(0x22, 0x8c), mix(0x26, 0xf8))
+        rim = QColor(mix(0x38, 0x81), mix(0x38, 0x8c), mix(0x40, 0xf8))
+        painter.fillPath(track, fill)
+        painter.setPen(QPen(rim, 1.0))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(track)
+        kx = sx + 2.0 + pos * (sw_w - 4.0 - 16.0)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 60))
+        painter.drawEllipse(QRectF(kx, sy + 3.0, 16.0, 16.0))
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawEllipse(QRectF(kx, sy + 2.0, 16.0, 16.0))
+        painter.end()
+
+
+def make_waveform_badge_pixmap(size: int = 48, color: str = "#818cf8", badge_bg: str = "#18181c", dpr: float = 2.0) -> QPixmap:
+    """Icona 'waveform.badge.plus' disegnata in vettoriale (equivalente SF Symbol di macOS)."""
+    phys = int(size * dpr)
+    pm = QPixmap(phys, phys)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.scale(dpr * size / 48.0, dpr * size / 48.0)
+    pen = QPen(QColor(color), 3.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+    p.setPen(pen)
+    for x, hh in ((6, 8), (13, 20), (20, 34), (27, 20), (34, 8)):
+        p.drawLine(QPointF(x, 20 - hh / 2.0), QPointF(x, 20 + hh / 2.0))
+    # Badge "+"
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(badge_bg))
+    p.drawEllipse(QPointF(37, 37), 11.5, 11.5)
+    p.setBrush(QColor(color))
+    p.drawEllipse(QPointF(37, 37), 9.5, 9.5)
+    p.setPen(QPen(QColor(badge_bg), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    p.drawLine(QPointF(37, 32.5), QPointF(37, 41.5))
+    p.drawLine(QPointF(32.5, 37), QPointF(41.5, 37))
+    p.end()
+    pm.setDevicePixelRatio(dpr)
+    return pm
+
+
+# ==============================================================================
+# ANIMATED 2-WAY CAPSULE SEGMENTED SWITCH
+# ==============================================================================
+class AnimatedSegmentedSwitch(QWidget):
+    """Switch a capsula a 2 vie con cursore scorrevole animato e supporto icone vettoriali."""
+    indexChanged = pyqtSignal(int)
+
+    def __init__(self, opt0_text: str, opt1_text: str, opt0_icon: QIcon = None, opt1_icon: QIcon = None, parent=None):
+        super().__init__(parent)
+        self._options = [
+            {"text": opt0_text, "icon": opt0_icon},
+            {"text": opt1_text, "icon": opt1_icon},
+        ]
+        self._current_index = 0
+        self._thumb_pos = 0.0
+        self._hover_idx = -1
+
+        self.setFixedHeight(32)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
+
+        self._anim = QPropertyAnimation(self, b"thumbPos", self)
+        self._anim.setDuration(170)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    @pyqtProperty(float)
+    def thumbPos(self) -> float:
+        return self._thumb_pos
+
+    @thumbPos.setter
+    def thumbPos(self, val: float):
+        self._thumb_pos = float(val)
+        self.update()
+
+    def current_index(self) -> int:
+        return self._current_index
+
+    def set_current_index(self, idx: int, animate: bool = True, emit_signal: bool = False):
+        idx = 1 if idx else 0
+        changed = (idx != self._current_index)
+        self._current_index = idx
+        target = float(idx)
+        self._anim.stop()
+        if animate and self.isVisible():
+            self._anim.setStartValue(self._thumb_pos)
+            self._anim.setEndValue(target)
+            self._anim.start()
+        else:
+            self._thumb_pos = target
+            self.update()
+        if emit_signal and changed:
+            self.indexChanged.emit(idx)
+
+    def set_option(self, idx: int, text: str, icon: QIcon = None):
+        if idx in (0, 1):
+            self._options[idx]["text"] = text
+            if icon is not None:
+                self._options[idx]["icon"] = icon
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self.isEnabled():
+            new_hover = 0 if event.position().x() < (self.width() / 2.0) else 1
+            if new_hover != self._hover_idx:
+                self._hover_idx = new_hover
+                self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover_idx = -1
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if self.isEnabled() and event.button() == Qt.MouseButton.LeftButton:
+            clicked_idx = 0 if event.position().x() < (self.width() / 2.0) else 1
+            if clicked_idx != self._current_index:
+                self.set_current_index(clicked_idx, animate=True, emit_signal=True)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+
+        w = float(self.width())
+        h = float(self.height())
+        enabled = self.isEnabled()
+        pad = 3.0
+        radius = 10.0
+
+        # Sfondo esterno (squircle 10, come AppleSegmentedSwitch macOS)
+        bg_path = QPainterPath()
+        bg_path.addRoundedRect(QRectF(0.5, 0.5, w - 1.0, h - 1.0), radius, radius)
+        painter.fillPath(bg_path, QColor("#161618"))
+        painter.setPen(QPen(QColor("#323238") if enabled else QColor("#27272a"), 1.0))
+        painter.drawPath(bg_path)
+
+        # Cursore selezionato (indigo pieno, raggio interno 7)
+        seg_w = (w - 2.0 * pad) / 2.0
+        seg_h = h - 2.0 * pad
+        thumb_x = pad + self._thumb_pos * seg_w
+        thumb_rect = QRectF(thumb_x, pad, seg_w, seg_h)
+        thumb_path = QPainterPath()
+        thumb_path.addRoundedRect(thumb_rect, 7.0, 7.0)
+        painter.fillPath(thumb_path, QColor("#818cf8") if enabled else QColor("#3f3f5a"))
+
+        # Testo e icona delle 2 opzioni
+        f = QFont(self.font())
+        f.setPixelSize(12)
+        painter.setFont(f)
+
+        for i in (0, 1):
+            opt = self._options[i]
+            rect_i = QRectF(pad + i * seg_w, pad, seg_w, seg_h)
+            is_sel = (i == self._current_index)
+            is_hov = (i == self._hover_idx and enabled and not is_sel)
+
+            f.setWeight(QFont.Weight.DemiBold)
+            painter.setFont(f)
+
+            if not enabled:
+                txt_col = QColor("#71717a") if is_sel else QColor("#52525b")
+            elif is_sel:
+                txt_col = QColor("#ffffff")
+            elif is_hov:
+                txt_col = QColor("#e4e4e7")
+            else:
+                txt_col = QColor("#a1a1aa")
+
+            painter.setPen(txt_col)
+            icon: QIcon = opt.get("icon")
+            txt: str = opt.get("text", "")
+            if icon and not icon.isNull():
+                icon_w, icon_h = 18, 13
+                fm = painter.fontMetrics()
+                txt_w = fm.horizontalAdvance(txt)
+                gap = 6
+                total_w = icon_w + gap + txt_w
+                start_x = rect_i.left() + max(4.0, (rect_i.width() - total_w) / 2.0)
+                icon_y = int(rect_i.center().y() - icon_h / 2.0)
+                pm = icon.pixmap(icon_w, icon_h)
+                painter.drawPixmap(int(start_x), icon_y, pm)
+                t_rect = QRectF(start_x + icon_w + gap, rect_i.top(), max(10.0, rect_i.right() - (start_x + icon_w + gap)), rect_i.height())
+                painter.drawText(t_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, txt)
+            else:
+                painter.drawText(rect_i, Qt.AlignmentFlag.AlignCenter, txt)
+
+        painter.end()
+
 # ==============================================================================
 # ANIMATED ROTATING LOADING SPINNER
 # ==============================================================================
@@ -1880,7 +2444,7 @@ class WhisperProgressBar(QProgressBar):
     """Progress bar with continuous antialiased pill curvature."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(12)
+        self.setFixedHeight(10)
         self.setTextVisible(False)
         self.setRange(0, 100)
         self.setValue(0)
@@ -1908,15 +2472,9 @@ class WhisperProgressBar(QProgressBar):
                 painter.setClipPath(bg_path)
                 fill_path = QPainterPath()
                 fill_path.addRoundedRect(0.0, 0.0, fill_w, h, radius, radius)
-                grad = QLinearGradient(0.0, 0.0, w, 0.0)
-                grad.setColorAt(0.0, QColor("#6366f1"))
-                grad.setColorAt(0.6, QColor("#818cf8"))
-                grad.setColorAt(1.0, QColor("#a5b4fc"))
-                painter.fillPath(fill_path, grad)
+                painter.fillPath(fill_path, QColor("#818cf8"))
                 painter.restore()
 
-        painter.setPen(QPen(QColor(255, 255, 255, 20), 1.0))
-        painter.drawPath(bg_path)
         painter.end()
 
 # ==============================================================================
@@ -1930,6 +2488,7 @@ class QueueItemCard(QFrame):
         self.idx = idx
         self.lang = lang
         self._drag_start_pos = None
+        self._internal_dragging = False
         self.is_selezionato = False
         self.is_drop_target = False
 
@@ -1960,7 +2519,7 @@ class QueueItemCard(QFrame):
         dur_str = format_time(self.file_info['durata'])
         peso_str = format_size(self.file_info['peso'])
         cartella_str = self.file_info['path'].parent.name
-        self.lbl_dettagli = QLabel(f"⏱️ {dur_str}  •  💾 {peso_str}  •  📂 {cartella_str}/")
+        self.lbl_dettagli = QLabel(f"⏱ {dur_str}   💾 {peso_str}   📂 {cartella_str}/")
         self.lbl_dettagli.setStyleSheet("font-size: 11px; color: #a1a1aa; background: transparent; border: none;")
         self.lbl_dettagli.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.lbl_dettagli.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
@@ -2034,13 +2593,21 @@ class QueueItemCard(QFrame):
         self.style().unpolish(self)
         self.style().polish(self)
 
+    def _find_parent_queue_list(self):
+        parent_list = self.parentWidget()
+        while parent_list and not isinstance(parent_list, QListWidget):
+            parent_list = parent_list.parentWidget()
+        if parent_list is None:
+            main_win = self.window()
+            parent_list = getattr(main_win, 'queue_list', None)
+        return parent_list
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_start_pos = event.pos()
+            self._internal_dragging = False
             self.set_selezionato(False)
-            parent_list = self.parentWidget()
-            while parent_list and not isinstance(parent_list, QListWidget):
-                parent_list = parent_list.parentWidget()
+            parent_list = self._find_parent_queue_list()
             if parent_list:
                 parent_list.clearSelection()
                 parent_list.setCurrentRow(-1)
@@ -2049,42 +2616,69 @@ class QueueItemCard(QFrame):
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._internal_dragging:
+            self._internal_dragging = False
+            self._drag_start_pos = None
+            parent_list = self._find_parent_queue_list()
+            if parent_list and hasattr(parent_list, 'finish_internal_card_drag'):
+                parent_list.finish_internal_card_drag(event.globalPosition().toPoint())
+            self.set_selezionato(False)
+            if parent_list:
+                parent_list.clearSelection()
+                parent_list.setCurrentRow(-1)
+            event.accept()
+            return
+
         self._drag_start_pos = None
         self.set_selezionato(False)
-        parent_list = self.parentWidget()
-        while parent_list and not isinstance(parent_list, QListWidget):
-            parent_list = parent_list.parentWidget()
+        parent_list = self._find_parent_queue_list()
         if parent_list:
             parent_list.clearSelection()
             parent_list.setCurrentRow(-1)
         super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._internal_dragging:
+            parent_list = self._find_parent_queue_list()
+            if not (event.buttons() & Qt.MouseButton.LeftButton) or self.file_info.get("stato") != "in_attesa":
+                self._internal_dragging = False
+                self._drag_start_pos = None
+                if parent_list and hasattr(parent_list, 'finish_internal_card_drag'):
+                    parent_list.finish_internal_card_drag(event.globalPosition().toPoint())
+                return
+            if parent_list and hasattr(parent_list, 'update_internal_card_drag'):
+                parent_list.update_internal_card_drag(event.globalPosition().toPoint())
+            event.accept()
+            return
+
         if self._drag_start_pos is not None and (event.buttons() & Qt.MouseButton.LeftButton):
-            main_win = self.window()
-            is_transcribing = bool(
-                hasattr(main_win, 'thread_lavoro')
-                and main_win.thread_lavoro
-                and main_win.thread_lavoro.isRunning()
-            )
-            if is_transcribing and self.file_info.get("stato") != "in_attesa":
+            if self.file_info.get("stato") != "in_attesa":
                 self._drag_start_pos = None
                 self.set_selezionato(False)
-                parent_list = self.parentWidget()
-                while parent_list and not isinstance(parent_list, QListWidget):
-                    parent_list = parent_list.parentWidget()
+                parent_list = self._find_parent_queue_list()
                 if parent_list:
                     parent_list.clearSelection()
                     parent_list.setCurrentRow(-1)
                 return
 
             if (event.pos() - self._drag_start_pos).manhattanLength() >= 8:
-                self._avvia_drag(event.pos())
+                self._internal_dragging = True
+                self._avvia_drag(event.pos(), event.globalPosition().toPoint())
                 self._drag_start_pos = None
+                event.accept()
                 return
         super().mouseMoveEvent(event)
 
-    def _avvia_drag(self, hotspot):
+    def wheelEvent(self, event):
+        if self._internal_dragging:
+            parent_list = self._find_parent_queue_list()
+            if parent_list and hasattr(parent_list, 'handle_drag_wheel'):
+                parent_list.handle_drag_wheel(event)
+                event.accept()
+                return
+        super().wheelEvent(event)
+
+    def _avvia_drag(self, hotspot, global_pos=None):
         pixmap = self.grab()
         sc_w = max(140, int(pixmap.width() * 0.45))
         sc_h = max(34, int(pixmap.height() * 0.45))
@@ -2101,29 +2695,21 @@ class QueueItemCard(QFrame):
         painter.drawRoundedRect(1, 1, ghost.width() - 2, ghost.height() - 2, 7, 7)
         painter.end()
 
-        drag = QDrag(self)
-        mime_data = QMimeData()
-        mime_data.setData("application/x-whisper-queue-item", str(self.idx).encode("utf-8"))
-        drag.setMimeData(mime_data)
-        drag.setPixmap(ghost)
-
         hs_x = int(hotspot.x() * (ghost.width() / max(1, pixmap.width())))
         hs_y = int(hotspot.y() * (ghost.height() / max(1, pixmap.height())))
-        drag.setHotSpot(QPoint(hs_x, hs_y))
 
-        main_win = self.window()
-        drag.exec(Qt.DropAction.MoveAction)
-        try:
-            if hasattr(main_win, 'queue_list') and main_win.queue_list is not None:
-                main_win.queue_list._rimuovi_hover_target()
-                main_win.queue_list.clearSelection()
-                main_win.queue_list.setCurrentRow(-1)
-            if hasattr(main_win, 'card_widgets'):
-                for c in main_win.card_widgets:
-                    c.set_selezionato(False)
-            self.set_selezionato(False)
-        except RuntimeError:
-            pass
+        queue_list = self._find_parent_queue_list()
+        if global_pos is None:
+            global_pos = self.mapToGlobal(hotspot)
+        if queue_list is not None and hasattr(queue_list, 'begin_internal_card_drag'):
+            queue_list.begin_internal_card_drag(
+                str(self.file_info.get("path", "")),
+                ghost,
+                QPoint(hs_x, hs_y),
+                global_pos
+            )
+        else:
+            self._internal_dragging = False
 
     def aggiorna_stato(self, stato, perc=None, t_trasc=None, t_rim=None, err_dettaglio=None):
         self.file_info["stato"] = stato
@@ -2180,7 +2766,7 @@ class QueueListWidget(QListWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setDragEnabled(True)
+        self.setDragEnabled(False)
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(False)
         self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
@@ -2188,6 +2774,136 @@ class QueueListWidget(QListWidget):
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setSpacing(8)
         self._current_hover_target = None
+        self._active_drag_src_path = ""
+        self._drag_scroll_dir = 0
+        self._drag_ghost_label = None
+        self._drag_hotspot = QPoint(0, 0)
+        self._drag_scroll_timer = QTimer(self)
+        self._drag_scroll_timer.setInterval(25)
+        self._drag_scroll_timer.timeout.connect(self._on_drag_scroll_tick)
+
+    def start_drag_tracking(self, src_path: str):
+        self._active_drag_src_path = src_path or ""
+
+    def stop_drag_tracking(self):
+        self._active_drag_src_path = ""
+        self._stop_drag_scroll()
+
+    def _stop_drag_scroll(self):
+        self._drag_scroll_dir = 0
+        if self._drag_scroll_timer.isActive():
+            self._drag_scroll_timer.stop()
+
+    def _update_edge_scroll(self, pos: QPoint):
+        margin = 44
+        vh = self.viewport().height()
+        sb = self.verticalScrollBar()
+        if pos.y() < margin and sb.value() > sb.minimum():
+            self._drag_scroll_dir = -1
+            if not self._drag_scroll_timer.isActive():
+                self._drag_scroll_timer.start()
+        elif pos.y() > vh - margin and sb.value() < sb.maximum():
+            self._drag_scroll_dir = 1
+            if not self._drag_scroll_timer.isActive():
+                self._drag_scroll_timer.start()
+        else:
+            self._stop_drag_scroll()
+
+    def _on_drag_scroll_tick(self):
+        if self._drag_scroll_dir == 0:
+            self._stop_drag_scroll()
+            return
+        sb = self.verticalScrollBar()
+        if (self._drag_scroll_dir < 0 and sb.value() <= sb.minimum()) or (
+            self._drag_scroll_dir > 0 and sb.value() >= sb.maximum()
+        ):
+            self._stop_drag_scroll()
+            return
+        self.scroll_during_drag(self._drag_scroll_dir * 12)
+
+    def scroll_during_drag(self, delta_pixels: int):
+        sb = self.verticalScrollBar()
+        new_val = max(sb.minimum(), min(sb.maximum(), sb.value() + delta_pixels))
+        if new_val != sb.value():
+            sb.setValue(new_val)
+        if self._active_drag_src_path:
+            src_row = self._row_for_path(self._active_drag_src_path)
+            if src_row >= 0 and self._is_row_waiting(src_row):
+                vp_pos = self.viewport().mapFromGlobal(QCursor.pos())
+                target_row = self._waiting_row_at_pos(vp_pos)
+                self._aggiorna_target_hover(target_row if (target_row >= 0 and target_row != src_row) else None)
+
+    def begin_internal_card_drag(self, src_path: str, ghost_pixmap: QPixmap, hotspot: QPoint, global_pos: QPoint):
+        if self._drag_ghost_label is not None:
+            self._drag_ghost_label.hide()
+            self._drag_ghost_label.deleteLater()
+            self._drag_ghost_label = None
+
+        self._active_drag_src_path = src_path or ""
+        self._drag_hotspot = hotspot
+        host_win = self.window() or self
+        lbl = QLabel(host_win)
+        lbl.setPixmap(ghost_pixmap)
+        lbl.setFixedSize(ghost_pixmap.size())
+        lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        lbl.setStyleSheet("background: transparent; border: none;")
+        lbl.show()
+        lbl.raise_()
+        self._drag_ghost_label = lbl
+        self.update_internal_card_drag(global_pos)
+
+    def update_internal_card_drag(self, global_pos: QPoint):
+        if self._drag_ghost_label is not None:
+            host_win = self._drag_ghost_label.parentWidget() or self.window()
+            if host_win is not None:
+                self._drag_ghost_label.move(host_win.mapFromGlobal(global_pos) - self._drag_hotspot)
+
+        src_row = self._row_for_path(self._active_drag_src_path)
+        if src_row < 0 or not self._is_row_waiting(src_row):
+            self._stop_drag_scroll()
+            self._rimuovi_hover_target()
+            return
+
+        pos = self.viewport().mapFromGlobal(global_pos)
+        self._update_edge_scroll(pos)
+        target_row = self._waiting_row_at_pos(pos)
+        self._aggiorna_target_hover(target_row if (target_row >= 0 and target_row != src_row) else None)
+
+    def handle_drag_wheel(self, event):
+        delta_y = event.angleDelta().y()
+        if delta_y == 0:
+            delta_y = event.pixelDelta().y()
+        if delta_y != 0:
+            px = -int(round(delta_y / 120.0 * 54))
+            if px == 0:
+                px = -1 if delta_y > 0 else 1
+            self.scroll_during_drag(px)
+
+    def wheelEvent(self, event):
+        if self._active_drag_src_path:
+            self.handle_drag_wheel(event)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    def finish_internal_card_drag(self, global_pos: QPoint):
+        src_path = self._active_drag_src_path
+        self.stop_drag_tracking()
+        if self._drag_ghost_label is not None:
+            self._drag_ghost_label.hide()
+            self._drag_ghost_label.deleteLater()
+            self._drag_ghost_label = None
+        self._rimuovi_hover_target()
+
+        src_row = self._row_for_path(src_path)
+        if src_row >= 0 and self._is_row_waiting(src_row):
+            pos = self.viewport().mapFromGlobal(global_pos)
+            dst_row = self._waiting_row_at_pos(pos)
+            if 0 <= src_row < self.count() and 0 <= dst_row < self.count() and src_row != dst_row and self._is_row_waiting(dst_row):
+                QTimer.singleShot(0, lambda s=src_row, d=dst_row: self.orderChanged.emit(s, d))
+
+        self.clearSelection()
+        self.setCurrentRow(-1)
 
     def _row_at_pos(self, pos: QPoint) -> int:
         cnt = self.count()
@@ -2222,12 +2938,41 @@ class QueueListWidget(QListWidget):
             return self._current_hover_target
         return 0 if y < first_rect.top() else (cnt - 1)
 
-    def _first_waiting_index(self, main_win) -> int:
-        if hasattr(main_win, 'coda_files'):
-            for i, it in enumerate(main_win.coda_files):
-                if it.get("stato") == "in_attesa":
-                    return i
+    def _row_for_path(self, path_str: str) -> int:
+        if not path_str:
+            return -1
+        for i in range(self.count()):
+            it = self.item(i)
+            card = self.itemWidget(it) if it else None
+            if card and hasattr(card, "file_info") and str(card.file_info.get("path", "")) == path_str:
+                return i
         return -1
+
+    def _is_row_waiting(self, row: int) -> bool:
+        if row < 0 or row >= self.count():
+            return False
+        it = self.item(row)
+        card = self.itemWidget(it) if it else None
+        return bool(card and hasattr(card, "file_info") and card.file_info.get("stato") == "in_attesa")
+
+    def _waiting_row_at_pos(self, pos: QPoint) -> int:
+        raw_row = self._row_at_pos(pos)
+        if 0 <= raw_row < self.count() and self._is_row_waiting(raw_row):
+            return raw_row
+        py = pos.y()
+        best_row = -1
+        best_dist = float("inf")
+        for i in range(self.count()):
+            if not self._is_row_waiting(i):
+                continue
+            it = self.item(i)
+            rect = self.visualItemRect(it)
+            if rect.isValid():
+                dist = abs(rect.center().y() - py)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_row = i
+        return best_row
 
     def _aggiorna_target_hover(self, target_row):
         if target_row == self._current_hover_target:
@@ -2258,85 +3003,45 @@ class QueueListWidget(QListWidget):
             self._current_hover_target = None
 
     def dragEnterEvent(self, event: QDragEnterEvent):
-        main_win = self.window()
-        is_transcribing = bool(
-            hasattr(main_win, 'thread_lavoro')
-            and main_win.thread_lavoro
-            and main_win.thread_lavoro.isRunning()
-        )
-
-        if event.mimeData().hasFormat("application/x-whisper-queue-item"):
-            try:
-                src_row = int(event.mimeData().data("application/x-whisper-queue-item").data().decode("utf-8"))
-            except Exception:
-                src_row = -1
-
-            if is_transcribing:
-                first_wait = self._first_waiting_index(main_win)
-                if first_wait < 0 or src_row < first_wait:
-                    event.ignore()
-                    return
-
-            pos = event.position().toPoint()
-            target_row = self._row_at_pos(pos)
-            if is_transcribing:
-                first_wait = self._first_waiting_index(main_win)
-                if first_wait >= 0 and target_row < first_wait:
-                    target_row = first_wait
-
-            self._aggiorna_target_hover(target_row)
-            event.acceptProposedAction()
-        elif event.mimeData().hasUrls():
+        if event.mimeData().hasUrls() or event.mimeData().hasFormat("application/x-whisper-queue-item"):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dragMoveEvent(self, event):
-        main_win = self.window()
-        is_transcribing = bool(
-            hasattr(main_win, 'thread_lavoro')
-            and main_win.thread_lavoro
-            and main_win.thread_lavoro.isRunning()
-        )
-
         if event.mimeData().hasFormat("application/x-whisper-queue-item"):
             try:
-                src_row = int(event.mimeData().data("application/x-whisper-queue-item").data().decode("utf-8"))
+                src_path = event.mimeData().data("application/x-whisper-queue-item").data().decode("utf-8")
             except Exception:
-                src_row = -1
-
-            if is_transcribing:
-                first_wait = self._first_waiting_index(main_win)
-                if first_wait < 0 or src_row < first_wait:
-                    event.ignore()
-                    return
-
+                src_path = ""
+            src_row = self._row_for_path(src_path)
+            if src_row < 0 or not self._is_row_waiting(src_row):
+                self._stop_drag_scroll()
+                self._rimuovi_hover_target()
+                event.ignore()
+                return
+            self._active_drag_src_path = src_path
             pos = event.position().toPoint()
-            target_row = self._row_at_pos(pos)
-            if is_transcribing:
-                first_wait = self._first_waiting_index(main_win)
-                if first_wait >= 0 and target_row < first_wait:
-                    target_row = first_wait
+            self._update_edge_scroll(pos)
 
-            self._aggiorna_target_hover(target_row)
+            target_row = self._waiting_row_at_pos(pos)
+            self._aggiorna_target_hover(target_row if (target_row >= 0 and target_row != src_row) else None)
             event.acceptProposedAction()
         elif event.mimeData().hasUrls():
+            self._stop_drag_scroll()
             event.acceptProposedAction()
         else:
+            self._stop_drag_scroll()
             event.ignore()
 
     def dragLeaveEvent(self, event):
+        self._stop_drag_scroll()
         self._rimuovi_hover_target()
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event: QDropEvent):
+        self._stop_drag_scroll()
         self._rimuovi_hover_target()
-        main_win = self.window()
-        is_transcribing = bool(
-            hasattr(main_win, 'thread_lavoro')
-            and main_win.thread_lavoro
-            and main_win.thread_lavoro.isRunning()
-        )
 
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
@@ -2348,25 +3053,21 @@ class QueueListWidget(QListWidget):
 
         if event.mimeData().hasFormat("application/x-whisper-queue-item"):
             try:
-                src_row = int(event.mimeData().data("application/x-whisper-queue-item").data().decode("utf-8"))
+                src_path = event.mimeData().data("application/x-whisper-queue-item").data().decode("utf-8")
             except Exception:
-                src_row = -1
+                src_path = ""
+            src_row = self._row_for_path(src_path)
+            if src_row < 0 or not self._is_row_waiting(src_row):
+                self.clearSelection()
+                self.setCurrentRow(-1)
+                event.ignore()
+                return
 
             pos = event.position().toPoint()
-            dst_row = self._row_at_pos(pos)
+            dst_row = self._waiting_row_at_pos(pos)
 
-            if is_transcribing:
-                first_wait = self._first_waiting_index(main_win)
-                if first_wait < 0 or src_row < first_wait:
-                    self.clearSelection()
-                    self.setCurrentRow(-1)
-                    event.ignore()
-                    return
-                if dst_row < first_wait:
-                    dst_row = first_wait
-
-            if 0 <= src_row < self.count() and 0 <= dst_row < self.count() and src_row != dst_row:
-                self.orderChanged.emit(src_row, dst_row)
+            if 0 <= src_row < self.count() and 0 <= dst_row < self.count() and src_row != dst_row and self._is_row_waiting(dst_row):
+                QTimer.singleShot(0, lambda s=src_row, d=dst_row: self.orderChanged.emit(s, d))
             self.clearSelection()
             self.setCurrentRow(-1)
             event.acceptProposedAction()
@@ -2577,7 +3278,7 @@ class HelpGuideDialog(QDialog):
     def _get_html_content(self) -> str:
         if self.lang == "it":
             return """
-            <h2 style='color: #ffffff; margin-bottom: 4px;'>Whisper Studio v2.7.5 — Guida & Istruzioni</h2>
+            <h2 style='color: #ffffff; margin-bottom: 4px;'>Whisper Studio v3.0.5 — Guida & Istruzioni</h2>
             <p style='color: #818cf8; font-weight: bold; margin-top: 0;'>Trascrizione Audio & Video Offline con NVIDIA CUDA & Intel/AMD CPU</p>
             <hr style='border: 0; border-top: 1px solid #27272a;'>
             
@@ -2608,7 +3309,7 @@ class HelpGuideDialog(QDialog):
             """
         else:
             return """
-            <h2 style='color: #ffffff; margin-bottom: 4px;'>Whisper Studio v2.7.5 — User Guide & Instructions</h2>
+            <h2 style='color: #ffffff; margin-bottom: 4px;'>Whisper Studio v3.0.5 — User Guide & Instructions</h2>
             <p style='color: #818cf8; font-weight: bold; margin-top: 0;'>Offline Audio & Video Transcription powered by NVIDIA CUDA & Intel/AMD CPU</p>
             <hr style='border: 0; border-top: 1px solid #27272a;'>
             
@@ -2637,6 +3338,368 @@ class HelpGuideDialog(QDialog):
             <h3 style='color: #e4e4e7;'>Supported Formats:</h3>
             <p>MP3, WAV, M4A, AAC, MP4, MKV, FLAC, OGG, WEBM, MOV, WMA, ALAC, OPUS.</p>
             """
+
+# ==============================================================================
+# GESTIONE AGGIORNAMENTI & VERSION CHECK (GITHUB RELEASES)
+# ==============================================================================
+def parse_semver(v: str):
+    """Parse stringhe versione come 'v2.7.5', '2.8.0', 'v2.8.0-rc1' in tuple (major, minor, patch)."""
+    clean = re.sub(r'^[vV]', '', str(v).strip())
+    m = re.match(r'^(\d+)(?:\.(\d+))?(?:\.(\d+))?', clean)
+    if not m:
+        return (0, 0, 0)
+    major = int(m.group(1) or 0)
+    minor = int(m.group(2) or 0)
+    patch = int(m.group(3) or 0)
+    return (major, minor, patch)
+
+def is_newer_version(remote: str, current: str) -> bool:
+    return parse_semver(remote) > parse_semver(current)
+
+def _render_inline_markdown(escaped_text: str) -> str:
+    """Converte link Markdown, URL nudi, grassetto e codice inline su testo già HTML-escaped."""
+    links = []
+
+    def _store_md_link(m):
+        label = m.group(1)
+        url = html.unescape(m.group(2))
+        safe_url = html.escape(url, quote=True)
+        token = f"@@LINK_{len(links)}@@"
+        links.append(f'<a href="{safe_url}" style="color:#818cf8; text-decoration:underline;">{label}</a>')
+        return token
+
+    def _store_bare_url(m):
+        url = html.unescape(m.group(0))
+        trailing = ""
+        while url and url[-1] in ".,);:!?":
+            trailing = url[-1] + trailing
+            url = url[:-1]
+        safe_url = html.escape(url, quote=True)
+        token = f"@@LINK_{len(links)}@@"
+        links.append(f'<a href="{safe_url}" style="color:#818cf8; text-decoration:underline;">{html.escape(url)}</a>')
+        return token + trailing
+
+    out = re.sub(r'\[([^\]]+)\]\((https?://[^\s)]+)\)', _store_md_link, escaped_text)
+    out = re.sub(r'https?://[^\s<>"\']+', _store_bare_url, out)
+    out = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', out)
+    out = re.sub(r'`(.+?)`', r'<code style="background:rgba(255,255,255,0.1); padding:1px 4px; border-radius:3px;">\1</code>', out)
+    for idx, anchor in enumerate(links):
+        out = out.replace(f"@@LINK_{idx}@@", anchor)
+    return out
+
+
+def format_markdown_to_html(md_text: str, lang: str = "it") -> str:
+    """Converte un changelog GitHub markdown in HTML renderizzabile in QTextBrowser."""
+    if not md_text:
+        empty_msg = "Nessuna nota di rilascio fornita." if lang == "it" else "No release notes provided."
+        return f"<p style='color:#a1a1aa;'><i>{empty_msg}</i></p>"
+    lines = md_text.replace('\r\n', '\n').split('\n')
+    html_lines = []
+    in_list = False
+    for line in lines:
+        sline = line.strip()
+        if not sline:
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            html_lines.append("<br>")
+            continue
+        if sline.startswith("### "):
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            html_lines.append(f"<h4 style='color:#818cf8; margin: 10px 0 4px 0;'>{_render_inline_markdown(html.escape(sline[4:]))}</h4>")
+            continue
+        elif sline.startswith("## "):
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            html_lines.append(f"<h3 style='color:#10b981; margin: 12px 0 6px 0;'>{_render_inline_markdown(html.escape(sline[3:]))}</h3>")
+            continue
+        elif sline.startswith("# "):
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            html_lines.append(f"<h2 style='color:#ffffff; margin: 14px 0 8px 0;'>{_render_inline_markdown(html.escape(sline[2:]))}</h2>")
+            continue
+        if sline.startswith("- ") or sline.startswith("* "):
+            if not in_list:
+                html_lines.append("<ul style='margin: 4px 0; padding-left: 20px;'>")
+                in_list = True
+            content = _render_inline_markdown(html.escape(sline[2:]))
+            html_lines.append(f"<li style='margin-bottom: 3px;'>{content}</li>")
+            continue
+        else:
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            content = _render_inline_markdown(html.escape(sline))
+            html_lines.append(f"<p style='margin: 2px 0;'>{content}</p>")
+    if in_list:
+        html_lines.append("</ul>")
+    return "\n".join(html_lines)
+
+
+def select_platform_asset_url(assets: list, fallback_url: str) -> str:
+    """Seleziona con precisione l'asset compatibile con il sistema operativo corrente, o fallback su html_url."""
+    if not isinstance(assets, list) or not assets:
+        return fallback_url
+
+    if sys.platform == "darwin":
+        include_tokens = ("macos", "mac", "osx", "darwin")
+        exclude_tokens = ("windows", "win32", "win64", "linux")
+        valid_exts = (".dmg", ".zip")
+    else:
+        include_tokens = ("windows", "win64", "win32", "win")
+        exclude_tokens = ("macos", "mac", "osx", "darwin", "linux")
+        valid_exts = (".zip", ".exe", ".msi")
+
+    for ext in valid_exts:
+        for asset in assets:
+            aname = str(asset.get("name", "")).strip()
+            alower = aname.lower()
+            if not alower.endswith(ext):
+                continue
+            if any(tok in alower for tok in exclude_tokens):
+                continue
+            if any(tok in alower for tok in include_tokens):
+                dl = asset.get("browser_download_url", "")
+                if dl:
+                    return dl
+    return fallback_url
+
+
+class UpdateCheckWorker(QThread):
+    update_available = pyqtSignal(str, str, str, str, str)  # tag, name, notes, html_url, dl_url
+    up_to_date = pyqtSignal(str)
+    check_failed = pyqtSignal(str)
+
+    def __init__(self, current_version=APP_VERSION, is_manual=False, skipped_version="", snoozed_version="", snoozed_until=0.0):
+        super().__init__()
+        self.current_version = current_version
+        self.is_manual = is_manual
+        self.skipped_version = skipped_version
+        self.snoozed_version = snoozed_version
+        self.snoozed_until = float(snoozed_until or 0.0)
+
+    def run(self):
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": f"WhisperStudio/{self.current_version}",
+                "Accept": "application/vnd.github+json"
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status != 200:
+                    self.check_failed.emit(f"HTTP {resp.status}")
+                    return
+                data = json.loads(resp.read().decode("utf-8"))
+
+            tag_name = str(data.get("tag_name", "")).strip()
+            if not tag_name:
+                self.check_failed.emit("Release non valida")
+                return
+
+            if data.get("draft", False) or data.get("prerelease", False):
+                self.up_to_date.emit(self.current_version)
+                return
+
+            if is_newer_version(tag_name, self.current_version):
+                if not self.is_manual:
+                    if self.skipped_version and parse_semver(tag_name) <= parse_semver(self.skipped_version):
+                        self.up_to_date.emit(self.current_version)
+                        return
+                    if (
+                        self.snoozed_version
+                        and self.snoozed_until > time.time()
+                        and parse_semver(tag_name) <= parse_semver(self.snoozed_version)
+                    ):
+                        self.up_to_date.emit(self.current_version)
+                        return
+
+                rel_name = data.get("name") or tag_name
+                body = data.get("body") or ""
+                html_url = data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases"
+                dl_url = select_platform_asset_url(data.get("assets", []), html_url)
+
+                self.update_available.emit(tag_name, rel_name, body, html_url, dl_url)
+            else:
+                self.up_to_date.emit(self.current_version)
+
+        except Exception as e:
+            self.check_failed.emit(str(e))
+
+class UpdateDialog(QDialog):
+    def __init__(self, current_ver: str, new_ver: str, release_name: str, changelog: str, download_url: str, lang="it", parent=None):
+        super().__init__(parent)
+        self.current_ver = current_ver
+        self.new_ver = new_ver
+        self.release_name = release_name
+        self.changelog = changelog
+        self.download_url = download_url
+        self.lang = lang
+        self.skip_requested = False
+        self.postpone_requested = False
+
+        s = STRINGS[lang]
+        self.setWindowTitle(s["update_dlg_title"])
+        self.setFixedSize(620, 480)
+        self.setModal(True)
+
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #18181b;
+                border: 1px solid #27272a;
+                border-radius: 12px;
+            }
+            QLabel {
+                color: #e4e4e7;
+            }
+            QTextBrowser {
+                background-color: #121214;
+                color: #e4e4e7;
+                border: 1px solid #27272a;
+                border-radius: 8px;
+                padding: 12px;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 13px;
+                line-height: 1.5;
+            }
+            QPushButton#btnUpdateDownload {
+                background-color: #6366f1;
+                color: #ffffff;
+                font-weight: bold;
+                font-size: 13px;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 16px;
+            }
+            QPushButton#btnUpdateDownload:hover {
+                background-color: #4f46e5;
+            }
+            QPushButton#btnUpdateLater {
+                background-color: #27272a;
+                color: #e4e4e7;
+                font-weight: 600;
+                font-size: 13px;
+                border: 1px solid #3f3f46;
+                border-radius: 8px;
+                padding: 8px 16px;
+            }
+            QPushButton#btnUpdateLater:hover {
+                background-color: #3f3f46;
+            }
+            QPushButton#btnUpdateSkip {
+                background-color: transparent;
+                color: #a1a1aa;
+                font-size: 12px;
+                border: 1px solid rgba(255, 255, 255, 0.16);
+                border-radius: 8px;
+                padding: 8px 14px;
+            }
+            QPushButton#btnUpdateSkip:hover {
+                background-color: #27272a;
+                color: #ffffff;
+                border: 1px solid rgba(255, 255, 255, 0.28);
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 18)
+        layout.setSpacing(14)
+
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(12)
+
+        icon_lbl = QLabel()
+        icon_lbl.setFixedSize(44, 44)
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_pm = None
+        for fname in ("wispr.png", "app_icon_black.png"):
+            p = DIR_CORRENTE / fname
+            if p.exists():
+                pm = QPixmap(str(p))
+                if not pm.isNull():
+                    icon_pm = pm.scaled(44, 44, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                    break
+        if icon_pm is None and parent is not None and not parent.windowIcon().isNull():
+            icon_pm = parent.windowIcon().pixmap(44, 44)
+        if icon_pm is not None and not icon_pm.isNull():
+            icon_lbl.setPixmap(icon_pm)
+        else:
+            icon_lbl.setText("🚀")
+            icon_lbl.setStyleSheet("font-size: 32px;")
+        header_layout.addWidget(icon_lbl)
+
+        info_layout = QVBoxLayout()
+        info_layout.setSpacing(2)
+
+        title_lbl = QLabel(s["update_available_header"])
+        title_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #ffffff;")
+        info_layout.addWidget(title_lbl)
+
+        display_new_ver = new_ver if str(new_ver).lower().startswith("v") else f"v{new_ver}"
+        ver_lbl = QLabel(f"{s['update_current_ver'].format(current=current_ver)} &nbsp;➔&nbsp; {s['update_new_ver'].format(new=display_new_ver)}")
+        ver_lbl.setStyleSheet("font-size: 12.5px; color: #a1a1aa;")
+        info_layout.addWidget(ver_lbl)
+
+        header_layout.addLayout(info_layout)
+        header_layout.addStretch()
+        layout.addLayout(header_layout)
+
+        ch_title = QLabel(f"<b>{s['update_changelog_title']}</b> <span style='color: #818cf8;'>({html.escape(release_name)})</span>")
+        ch_title.setStyleSheet("font-size: 12px; color: #e4e4e7;")
+        layout.addWidget(ch_title)
+
+        self.browser = QTextBrowser()
+        self.browser.setOpenExternalLinks(True)
+        self.browser.setHtml(format_markdown_to_html(changelog, lang=self.lang))
+        layout.addWidget(self.browser)
+
+        btn_box = QHBoxLayout()
+        btn_box.setSpacing(10)
+
+        btn_skip = QPushButton(s["btn_skip_version"])
+        btn_skip.setObjectName("btnUpdateSkip")
+        btn_skip.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_skip.setFixedHeight(36)
+        btn_skip.clicked.connect(self._on_skip)
+        btn_box.addWidget(btn_skip)
+
+        btn_box.addStretch()
+
+        btn_later = QPushButton(s["btn_update_later"])
+        btn_later.setObjectName("btnUpdateLater")
+        btn_later.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_later.setFixedHeight(36)
+        btn_later.setMinimumWidth(100)
+        btn_later.clicked.connect(self._on_postpone)
+        btn_box.addWidget(btn_later)
+
+        btn_download = QPushButton(s["btn_download_update"])
+        btn_download.setObjectName("btnUpdateDownload")
+        btn_download.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_download.setFixedHeight(36)
+        btn_download.setMinimumWidth(180)
+        btn_download.clicked.connect(self._on_download)
+        btn_box.addWidget(btn_download)
+
+        layout.addLayout(btn_box)
+
+    def _on_download(self):
+        QDesktopServices.openUrl(QUrl(self.download_url))
+        self.accept()
+
+    def _on_skip(self):
+        self.skip_requested = True
+        self.reject()
+
+    def _on_postpone(self):
+        self.postpone_requested = True
+        self.reject()
 
 # ==============================================================================
 # MAIN APPLICATION WINDOW
@@ -2674,9 +3737,11 @@ class WhisperStudioWindow(QMainWindow):
         self._flag_icon_en = create_flag_icon("en")
 
         self.coda_files = []
-        self.queue_lock = threading.Lock()
+        self.queue_lock = threading.RLock()
         self.card_widgets = []
         self.thread_lavoro = None
+        self.download_worker = None
+        self._dangling_workers = []
         self.modalita_manuale = False
         self._active_file_path = None
 
@@ -2691,6 +3756,11 @@ class WhisperStudioWindow(QMainWindow):
         self._carica_impostazioni_modello()
         self._initializing = False
         self._avvia_timer_memoria()
+
+        self.update_worker = None
+        self._session_notified_versions = set()
+        self._update_dialog_open = False
+        QTimer.singleShot(10000, lambda: self.controlla_aggiornamenti(is_manual=False))
 
     def __setattr__(self, name, value):
         if name in ("dev_type", "vram_gb") and "_is_high_spec_override" in self.__dict__:
@@ -2710,6 +3780,8 @@ class WhisperStudioWindow(QMainWindow):
     def _aggiorna_info_modello_auto(self):
         if not hasattr(self, "lbl_auto_modello") or not hasattr(self, "lbl_auto_desc"):
             return
+        if hasattr(self, "lbl_auto_icon"):
+            self.lbl_auto_icon.setText("💎" if self.is_high_spec else "⚡")
         if self.is_high_spec:
             self.lbl_auto_modello.setText(f"<b>{self.t('model_large_title')}</b>")
             if self.dev_type == "cuda":
@@ -2755,11 +3827,71 @@ class WhisperStudioWindow(QMainWindow):
         self.grp_lang.addAction(self.act_en)
         self.menu_lang.addAction(self.act_en)
 
-        # 2. Menu Aiuto / Help
+        # 2. Menu Impostazioni / Settings
+        self.menu_settings = mb.addMenu(self.t("menu_settings"))
+
+        # Opzione: Controlla automaticamente gli aggiornamenti
+        self.act_auto_updates = QAction(self.t("sett_auto_updates"), self)
+        self.act_auto_updates.setCheckable(True)
+        self.act_auto_updates.setChecked(self.settings.value("auto_check_updates", True, type=bool))
+        self.act_auto_updates.toggled.connect(self._on_toggle_auto_updates)
+        self.menu_settings.addAction(self.act_auto_updates)
+
+        # Opzione: Ricorda l'ultima modalità del motore
+        self.act_remember_engine = QAction(self.t("sett_remember_engine"), self)
+        self.act_remember_engine.setCheckable(True)
+        self.act_remember_engine.setChecked(self.settings.value("remember_engine_mode", True, type=bool))
+        self.act_remember_engine.toggled.connect(self._on_toggle_remember_engine)
+        self.menu_settings.addAction(self.act_remember_engine)
+
+        self.menu_settings.addSeparator()
+
+        # Sottomenu dedicato: Salva trascrizioni in
+        self.menu_dest = self.menu_settings.addMenu(self.t("sett_dest_header"))
+
+        self.grp_dest = QActionGroup(self)
+        self.grp_dest.setExclusive(True)
+
+        dest_mode = self.settings.value("dest_mode", "source", type=str)
+        if dest_mode not in ("source", "custom", "ask"):
+            dest_mode = "source"
+
+        self.act_dest_source = QAction(self.t("sett_dest_source"), self)
+        self.act_dest_source.setCheckable(True)
+        self.act_dest_source.setChecked(dest_mode == "source")
+        self.act_dest_source.triggered.connect(lambda: self._set_dest_mode("source"))
+        self.grp_dest.addAction(self.act_dest_source)
+        self.menu_dest.addAction(self.act_dest_source)
+
+        self.act_dest_custom = QAction(self.t("sett_dest_custom"), self)
+        self.act_dest_custom.setCheckable(True)
+        self.act_dest_custom.setChecked(dest_mode == "custom")
+        self.act_dest_custom.triggered.connect(self._seleziona_cartella_personalizzata)
+        self.grp_dest.addAction(self.act_dest_custom)
+        self.menu_dest.addAction(self.act_dest_custom)
+
+        # Riga secondaria con il percorso abbreviato della cartella personalizzata (non selezionabile)
+        self.act_dest_custom_path = QAction("", self)
+        self.act_dest_custom_path.setEnabled(False)
+        self.menu_dest.addAction(self.act_dest_custom_path)
+        self._aggiorna_label_cartella_personalizzata()
+
+        self.act_dest_ask = QAction(self.t("sett_dest_ask"), self)
+        self.act_dest_ask.setCheckable(True)
+        self.act_dest_ask.setChecked(dest_mode == "ask")
+        self.act_dest_ask.triggered.connect(lambda: self._set_dest_mode("ask"))
+        self.grp_dest.addAction(self.act_dest_ask)
+        self.menu_dest.addAction(self.act_dest_ask)
+
+        # 3. Menu Aiuto / Help
         self.menu_help = mb.addMenu(self.t("menu_help"))
         self.act_help = QAction(self.t("menu_guide"), self)
         self.act_help.triggered.connect(self.mostra_guida)
         self.menu_help.addAction(self.act_help)
+
+        self.act_check_updates = QAction(self.t("menu_check_updates"), self)
+        self.act_check_updates.triggered.connect(lambda: self.controlla_aggiornamenti(is_manual=True))
+        self.menu_help.addAction(self.act_check_updates)
 
         self.act_logs = QAction(self.t("menu_open_logs"), self)
         self.act_logs.triggered.connect(self._apri_cartella_logs)
@@ -2773,11 +3905,139 @@ class WhisperStudioWindow(QMainWindow):
         dlg = HelpGuideDialog(lang=self.current_lang, parent=self)
         dlg.exec()
 
+    def controlla_aggiornamenti(self, is_manual=False):
+        if not is_manual:
+            if not self.settings.value("auto_check_updates", True, type=bool):
+                return
+            if (getattr(self, "download_worker", None) and self.download_worker.isRunning()) or (
+                getattr(self, "thread_lavoro", None) and self.thread_lavoro.isRunning()
+            ):
+                return
+            last_ts = self.settings.value("last_update_check_ts", 0, type=float)
+            if (time.time() - last_ts) < 86400:
+                return
+
+        if hasattr(self, "update_worker") and self.update_worker and self.update_worker.isRunning():
+            if is_manual:
+                QMessageBox.information(self, self.t("update_checking_title"), self.t("update_checking_msg"))
+            return
+
+        skipped = self.settings.value("skipped_update_version", "", type=str)
+        snoozed_ver = self.settings.value("snoozed_update_version", "", type=str)
+        snoozed_until = self.settings.value("snoozed_update_until", 0.0, type=float)
+        self.update_worker = UpdateCheckWorker(
+            current_version=APP_VERSION,
+            is_manual=is_manual,
+            skipped_version=skipped,
+            snoozed_version=snoozed_ver,
+            snoozed_until=snoozed_until
+        )
+        self.update_worker.update_available.connect(
+            lambda rver, rname, body, hurl, durl: self._on_update_available(
+                rver, rname, body, hurl, durl, is_manual=is_manual
+            )
+        )
+        self.update_worker.up_to_date.connect(lambda v: self._on_update_status(True, is_manual, v))
+        self.update_worker.check_failed.connect(lambda err: self._on_update_status(False, is_manual, err))
+        self.update_worker.start()
+
+    def _on_update_available(self, remote_ver, rel_name, body, html_url, dl_url, is_manual=False):
+        self.settings.setValue("last_update_check_ts", time.time())
+        if self._update_dialog_open:
+            return
+        if not is_manual and remote_ver in self._session_notified_versions:
+            return
+        self._session_notified_versions.add(remote_ver)
+        self._update_dialog_open = True
+        try:
+            dlg = UpdateDialog(
+                current_ver=APP_VERSION,
+                new_ver=remote_ver,
+                release_name=rel_name,
+                changelog=body,
+                download_url=dl_url,
+                lang=self.current_lang,
+                parent=self
+            )
+            dlg.exec()
+            if dlg.skip_requested:
+                self.settings.setValue("skipped_update_version", remote_ver)
+            elif dlg.postpone_requested:
+                self.settings.setValue("snoozed_update_version", remote_ver)
+                self.settings.setValue("snoozed_update_until", time.time() + 86400)
+        finally:
+            self._update_dialog_open = False
+
+    def _on_update_status(self, is_ok: bool, is_manual: bool, info: str):
+        if is_ok:
+            self.settings.setValue("last_update_check_ts", time.time())
+            if is_manual:
+                QMessageBox.information(
+                    self,
+                    self.t("update_up_to_date_title"),
+                    self.t("update_up_to_date_msg", version=info)
+                )
+        else:
+            if is_manual:
+                QMessageBox.warning(
+                    self,
+                    self.t("update_error_title"),
+                    self.t("update_error_msg", err=info)
+                )
+
     def _apri_cartella_logs(self):
         open_directory_in_explorer(str(LOG_DIR))
 
     def _mostra_about(self):
         QMessageBox.about(self, self.t("about_title"), self.t("about_text"))
+
+    def _on_toggle_auto_updates(self, checked: bool):
+        self.settings.setValue("auto_check_updates", bool(checked))
+
+    def _on_toggle_remember_engine(self, checked: bool):
+        self.settings.setValue("remember_engine_mode", bool(checked))
+        if checked:
+            self._salva_impostazioni_modello()
+
+    def _set_dest_mode(self, mode: str):
+        if mode not in ("source", "custom", "ask"):
+            mode = "source"
+        self.settings.setValue("dest_mode", mode)
+        self.act_dest_source.setChecked(mode == "source")
+        self.act_dest_custom.setChecked(mode == "custom")
+        self.act_dest_ask.setChecked(mode == "ask")
+
+    def _aggiorna_label_cartella_personalizzata(self):
+        custom_p = self.settings.value("custom_dest_folder", "", type=str)
+        if custom_p:
+            home_str = str(Path.home())
+            disp_path = custom_p.replace(home_str, "~") if custom_p.startswith(home_str) else custom_p
+            if len(disp_path) > 34:
+                disp_path = "…" + disp_path[-33:]
+            self.act_dest_custom_path.setText(f"    {disp_path}")
+            self.act_dest_custom_path.setToolTip(custom_p)
+            self.act_dest_custom_path.setVisible(True)
+        else:
+            self.act_dest_custom_path.setText("")
+            self.act_dest_custom_path.setToolTip("")
+            self.act_dest_custom_path.setVisible(False)
+
+    def _seleziona_cartella_personalizzata(self):
+        cur_p = self.settings.value("custom_dest_folder", "", type=str)
+        start_dir = cur_p if (cur_p and os.path.exists(cur_p)) else str(Path.home())
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            self.t("dlg_choose_dest_title"),
+            start_dir,
+            QFileDialog.Option.ShowDirsOnly
+        )
+        if chosen:
+            self.settings.setValue("custom_dest_folder", str(Path(chosen).resolve()))
+            self._set_dest_mode("custom")
+            self._aggiorna_label_cartella_personalizzata()
+        else:
+            cur_mode = self.settings.value("dest_mode", "source", type=str)
+            self._set_dest_mode(cur_mode)
 
     def set_language(self, lang: str):
         if lang not in ("it", "en"):
@@ -2791,10 +4051,28 @@ class WhisperStudioWindow(QMainWindow):
         self.menu_lang.setTitle(self.t("menu_language"))
         if self.menu_lang.menuAction():
             self.menu_lang.menuAction().setText(self.t("menu_language"))
+
+        if hasattr(self, "menu_settings") and self.menu_settings:
+            self.menu_settings.setTitle(self.t("menu_settings"))
+            if self.menu_settings.menuAction():
+                self.menu_settings.menuAction().setText(self.t("menu_settings"))
+            self.act_auto_updates.setText(self.t("sett_auto_updates"))
+            self.act_remember_engine.setText(self.t("sett_remember_engine"))
+            if hasattr(self, "menu_dest") and self.menu_dest:
+                self.menu_dest.setTitle(self.t("sett_dest_header"))
+                if self.menu_dest.menuAction():
+                    self.menu_dest.menuAction().setText(self.t("sett_dest_header"))
+            self.act_dest_source.setText(self.t("sett_dest_source"))
+            self.act_dest_custom.setText(self.t("sett_dest_custom"))
+            self.act_dest_ask.setText(self.t("sett_dest_ask"))
+            self._aggiorna_label_cartella_personalizzata()
+
         self.menu_help.setTitle(self.t("menu_help"))
         if self.menu_help.menuAction():
             self.menu_help.menuAction().setText(self.t("menu_help"))
         self.act_help.setText(self.t("menu_guide"))
+        if hasattr(self, "act_check_updates"):
+            self.act_check_updates.setText(self.t("menu_check_updates"))
         self.act_logs.setText(self.t("menu_open_logs"))
         self.act_about.setText(self.t("menu_about"))
 
@@ -2813,20 +4091,25 @@ class WhisperStudioWindow(QMainWindow):
         self._aggiorna_memoria_display()
 
         self.lbl_m_title.setText(self.t("section_model"))
+        if hasattr(self, "seg_mode"):
+            self.seg_mode.set_option(0, self.t("seg_mode_auto"))
+            self.seg_mode.set_option(1, self.t("seg_mode_manual"))
         self.lbl_auto_tag.setText(self.t("auto_tag"))
         self._aggiorna_info_modello_auto()
 
-        self.btn_passa_manuale.setText(self.t("btn_switch_manual"))
         self.lbl_man_tag.setText(self.t("manual_tag"))
         self.btn_large.setText(self.t("btn_large"))
         self.btn_small.setText(self.t("btn_small"))
-        self.btn_torna_auto.setText(self.t("btn_return_auto"))
         self._aggiorna_avviso_manuale()
 
         self.lbl_l_title.setText(self.t("section_lang"))
-        self.btn_it.setText(self.t("btn_lang_primary"))
-        self.btn_it.setIcon(self._flag_icon_it if self.current_lang == "it" else self._flag_icon_en)
-        self.btn_auto.setText(self.t("btn_lang_auto"))
+        if hasattr(self, "seg_lingua"):
+            self.seg_lingua.set_option(
+                0,
+                self.t("btn_lang_primary"),
+                self._flag_icon_it if self.current_lang == "it" else self._flag_icon_en
+            )
+            self.seg_lingua.set_option(1, self.t("btn_lang_auto"))
         self.lbl_sub_l.setText(self.t("lang_subtitle"))
 
         self.lbl_f_title.setText(self.t("section_formats"))
@@ -2843,14 +4126,23 @@ class WhisperStudioWindow(QMainWindow):
         self.lbl_empty_t.setText(self.t("empty_title"))
         self.lbl_empty_sub.setText(self.t("empty_subtitle"))
 
-        self.btn_ferma.setText(self.t("btn_cancel"))
-        if self.thread_lavoro and self.thread_lavoro.isRunning() and self.thread_lavoro.is_paused:
-            self.btn_pausa.setText(self.t("btn_resume"))
+        is_dl_running = bool(self.download_worker and self.download_worker.isRunning())
+        is_tr_running = bool(self.thread_lavoro and self.thread_lavoro.isRunning())
+        if is_dl_running:
+            self.btn_pausa.setText(self.t("btn_pause_download"))
+            self.btn_ferma.setText(self.t("btn_cancel_download"))
+        elif is_tr_running:
+            if not self.btn_pausa.isVisible():
+                self.btn_ferma.setText(self.t("btn_cancel_download"))
+            else:
+                self.btn_ferma.setText(self.t("btn_cancel"))
+            self.btn_pausa.setText(self.t("btn_resume") if self.thread_lavoro.is_paused else self.t("btn_pause"))
         else:
+            self.btn_ferma.setText(self.t("btn_cancel"))
             self.btn_pausa.setText(self.t("btn_pause"))
-        self.btn_avvia.setText(self.t("btn_start"))
+            self._aggiorna_stato_pulsante_principale()
 
-        if not (self.thread_lavoro and self.thread_lavoro.isRunning()):
+        if not is_tr_running and not is_dl_running:
             self.lbl_stato.setText(self.t("status_ready"))
             if hasattr(self, 'spinner_loading'):
                 self.spinner_loading.stop()
@@ -2904,19 +4196,30 @@ class WhisperStudioWindow(QMainWindow):
         centrale.setAcceptDrops(True)
         self.setCentralWidget(centrale)
         layout_orizzontale = QHBoxLayout(centrale)
-        layout_orizzontale.setContentsMargins(14, 12, 14, 12)
-        layout_orizzontale.setSpacing(14)
+        layout_orizzontale.setContentsMargins(0, 0, 0, 0)
+        layout_orizzontale.setSpacing(0)
 
-        # 1. SIDEBAR VERTICALE SINISTRA
+        # ------------------------------------------------------------------
+        # 1. SIDEBAR (piatta, 295px, divisore a 1px: stesso schema di macOS)
+        # ------------------------------------------------------------------
         sidebar = QFrame()
         sidebar.setObjectName("sidebarFrame")
-        sidebar.setFixedWidth(310)
+        sidebar.setFixedWidth(295)
         self.sidebar = sidebar
-        s_layout = QVBoxLayout(sidebar)
-        s_layout.setContentsMargins(14, 7, 14, 7)
-        s_layout.setSpacing(4)
+        sb_outer = QVBoxLayout(sidebar)
+        sb_outer.setContentsMargins(0, 0, 0, 0)
+        sb_outer.setSpacing(0)
 
-        # Header / Logo (New icon on black background with Windows 8px rounded corners)
+        sb_body = QWidget()
+        s_layout = QVBoxLayout(sb_body)
+        s_layout.setContentsMargins(18, 18, 18, 14)
+        s_layout.setSpacing(16)
+        sb_outer.addWidget(sb_body, 1)
+
+        # --- Titolo app + badge hardware ---
+        head_group = QVBoxLayout()
+        head_group.setSpacing(8)
+
         header_box = QHBoxLayout()
         header_box.setSpacing(10)
         icon_black = DIR_CORRENTE / "app_icon_black.png"
@@ -2925,29 +4228,15 @@ class WhisperStudioWindow(QMainWindow):
         if logo_src.exists():
             logo_lbl = QLabel()
             dpr = 2.0
-            dim_logica = 36
+            dim_logica = 28
             phys_sz = int(dim_logica * dpr)
             raw_pix = QPixmap(str(logo_src)).scaled(
                 phys_sz, phys_sz,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation
             )
-            rounded_pix = QPixmap(phys_sz, phys_sz)
-            rounded_pix.fill(Qt.GlobalColor.transparent)
-            lp = QPainter(rounded_pix)
-            lp.setRenderHint(QPainter.RenderHint.Antialiasing)
-            lp.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-            clip_path = QPainterPath()
-            clip_path.addRoundedRect(QRectF(0.5, 0.5, phys_sz - 1.0, phys_sz - 1.0), 16.0, 16.0)
-            lp.setClipPath(clip_path)
-            lp.fillRect(0, 0, phys_sz, phys_sz, QColor("#08080c"))
-            lp.drawPixmap(0, 0, raw_pix)
-            lp.setClipping(False)
-            lp.setPen(QPen(QColor(255, 255, 255, 34), 1.5))
-            lp.drawPath(clip_path)
-            lp.end()
-            rounded_pix.setDevicePixelRatio(dpr)
-            logo_lbl.setPixmap(rounded_pix)
+            raw_pix.setDevicePixelRatio(dpr)
+            logo_lbl.setPixmap(raw_pix)
             logo_lbl.setFixedSize(dim_logica, dim_logica)
             logo_lbl.setStyleSheet("background: transparent; border: none;")
             self.logo_lbl = logo_lbl
@@ -2955,7 +4244,7 @@ class WhisperStudioWindow(QMainWindow):
 
         v_title = QVBoxLayout()
         v_title.setSpacing(2)
-        lbl_title = QLabel("WHISPER STUDIO")
+        lbl_title = QLabel("Whisper Studio")
         lbl_title.setObjectName("titleLabel")
         lbl_title.setStyleSheet("background: transparent; border: none;")
         self.lbl_sub = QLabel(self.t("sub_edition"))
@@ -2965,109 +4254,91 @@ class WhisperStudioWindow(QMainWindow):
         v_title.addWidget(self.lbl_sub)
         header_box.addLayout(v_title)
         header_box.addStretch()
-        s_layout.addLayout(header_box)
-
-        # Indicatori Hardware
-        stats_box = QVBoxLayout()
-        stats_box.setSpacing(2)
+        head_group.addLayout(header_box)
 
         self.lbl_hw = QLabel(self.t("hw_label_cuda") if self.dev_type == "cuda" else self.t("hw_label_cpu"))
-        self.lbl_hw.setStyleSheet(f"color: {self.hw_color}; font-size: 12px; font-weight: 600; background: transparent; border: none; padding: 0;")
-        stats_box.addWidget(self.lbl_hw)
+        self.lbl_hw.setStyleSheet(f"color: {self.hw_color}; font-size: 12px; font-weight: 500; background: transparent; border: none; padding: 0;")
+        head_group.addWidget(self.lbl_hw)
+        s_layout.addLayout(head_group)
 
+        # --- Card RAM / VRAM ---
+        ram_card = QFrame()
+        ram_card.setObjectName("ramCard")
+        ram_lay = QVBoxLayout(ram_card)
+        ram_lay.setContentsMargins(10, 10, 10, 10)
+        ram_lay.setSpacing(8)
         self.lbl_ram = QLabel("")
-        self.lbl_ram.setStyleSheet("color: #a1a1aa; font-size: 11px; font-weight: 500; background: transparent; border: none; padding: 0;")
-        stats_box.addWidget(self.lbl_ram)
-
+        self.lbl_ram.setStyleSheet("color: #e4e4e7; font-size: 12px; font-weight: 500; background: transparent; border: none; padding: 0;")
+        ram_lay.addWidget(self.lbl_ram)
         self.ram_gauge = RAMGaugeBar()
-        stats_box.addWidget(self.ram_gauge)
+        ram_lay.addWidget(self.ram_gauge)
+        s_layout.addWidget(ram_card)
 
-        s_layout.addLayout(stats_box)
+        # --- Modello di trascrizione ---
+        model_group = QVBoxLayout()
+        model_group.setSpacing(8)
 
-        sep1 = QFrame()
-        sep1.setFrameShape(QFrame.Shape.HLine)
-        sep1.setStyleSheet("background-color: #27272a; max-height: 1px; border: none;")
-        self.sep1 = sep1
-        s_layout.addWidget(sep1)
-
-        # Modello di Trascrizione
         self.lbl_m_title = QLabel(self.t("section_model"))
         self.lbl_m_title.setObjectName("sectionTitle")
         self.lbl_m_title.setStyleSheet("background: transparent; border: none;")
-        s_layout.addWidget(self.lbl_m_title)
+        model_group.addWidget(self.lbl_m_title)
 
-        # Scheda Modalità Automatica
+        self.seg_mode = AnimatedSegmentedSwitch(self.t("seg_mode_auto"), self.t("seg_mode_manual"))
+        self.seg_mode.indexChanged.connect(self._on_switch_mode_changed)
+        model_group.addWidget(self.seg_mode)
+
+        # Scheda modalita' automatica: icona | titolo + descrizione | spunta
         self.card_auto = QFrame()
         self.card_auto.setObjectName("cardAutoModello")
         self.card_auto.setStyleSheet("""
             QFrame#cardAutoModello {
-                background-color: #1c1c1f;
-                border: 1px solid #2e2e34;
-                border-radius: 10px;
+                background-color: #2e2a52;
+                border: 1.5px solid #818cf8;
+                border-radius: 12px;
             }
         """)
-        lay_auto = QVBoxLayout(self.card_auto)
-        lay_auto.setContentsMargins(12, 10, 12, 10)
-        lay_auto.setSpacing(6)
+        lay_auto = QHBoxLayout(self.card_auto)
+        lay_auto.setContentsMargins(10, 10, 10, 10)
+        lay_auto.setSpacing(10)
 
-        self.lbl_auto_tag = QLabel(self.t("auto_tag"))
-        self.lbl_auto_tag.setStyleSheet("font-size: 13px; font-weight: bold; color: #818cf8; background: transparent; border: none;")
-        lay_auto.addWidget(self.lbl_auto_tag)
+        self.lbl_auto_tag = QLabel(self.t("auto_tag"), self.card_auto)
+        self.lbl_auto_tag.hide()
 
+        self.lbl_auto_icon = QLabel("💎")
+        self.lbl_auto_icon.setFixedWidth(22)
+        self.lbl_auto_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_auto_icon.setStyleSheet("font-size: 16px; background: transparent; border: none;")
+        lay_auto.addWidget(self.lbl_auto_icon)
+
+        auto_txt = QVBoxLayout()
+        auto_txt.setSpacing(2)
         self.lbl_auto_modello = QLabel("")
+        self.lbl_auto_modello.setWordWrap(True)
         self.lbl_auto_modello.setStyleSheet("font-size: 12px; color: #ffffff; background: transparent; border: none;")
-        lay_auto.addWidget(self.lbl_auto_modello)
-
+        auto_txt.addWidget(self.lbl_auto_modello)
         self.lbl_auto_desc = QLabel("")
         self.lbl_auto_desc.setStyleSheet("font-size: 11px; color: #a1a1aa; background: transparent; border: none;")
         self.lbl_auto_desc.setWordWrap(True)
-        lay_auto.addWidget(self.lbl_auto_desc)
+        auto_txt.addWidget(self.lbl_auto_desc)
+        lay_auto.addLayout(auto_txt, 1)
 
-        self.btn_passa_manuale = QPushButton(self.t("btn_switch_manual"))
-        self.btn_passa_manuale.setObjectName("btnPassaManuale")
-        self.btn_passa_manuale.setFixedHeight(34)
-        self.btn_passa_manuale.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_passa_manuale.setStyleSheet("""
-            QPushButton#btnPassaManuale {
-                background-color: #27272a;
-                color: #d4d4d8;
-                border: 1px solid #3f3f46;
-                border-radius: 7px;
-                padding: 6px 10px;
-                font-size: 12px;
-                font-weight: 600;
-                margin-top: 3px;
-            }
-            QPushButton#btnPassaManuale:hover {
-                background-color: #3f3f46;
-                color: #ffffff;
-                border-color: #818cf8;
-            }
-        """)
-        self.btn_passa_manuale.clicked.connect(self._richiedi_passaggio_manuale)
-        lay_auto.addWidget(self.btn_passa_manuale)
+        auto_check = QLabel("✓")
+        auto_check.setFixedSize(18, 18)
+        auto_check.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        auto_check.setStyleSheet("background-color: #818cf8; color: #18181b; border: none; border-radius: 9px; font-size: 11px; font-weight: bold;")
+        lay_auto.addWidget(auto_check, 0, Qt.AlignmentFlag.AlignVCenter)
+        model_group.addWidget(self.card_auto)
 
-        s_layout.addWidget(self.card_auto)
-
-        # Scheda Modalità Manuale
+        # Modalita' manuale: due pulsanti-card impilati (senza contenitore)
         self.card_manuale = QFrame()
         self.card_manuale.setObjectName("cardManualeModello")
-        self.card_manuale.setStyleSheet("""
-            QFrame#cardManualeModello {
-                background-color: #18181b;
-                border: 1px solid #3f3f46;
-                border-radius: 10px;
-            }
-        """)
-        self.card_manuale.setMinimumHeight(300)
+        self.card_manuale.setStyleSheet("QFrame#cardManualeModello { background: transparent; border: none; }")
         lay_man = QVBoxLayout(self.card_manuale)
-        lay_man.setContentsMargins(12, 10, 12, 10)
-        lay_man.setSpacing(6)
+        lay_man.setContentsMargins(0, 0, 0, 0)
+        lay_man.setSpacing(8)
 
-        self.lbl_man_tag = QLabel(self.t("manual_tag"))
-        self.lbl_man_tag.setFixedHeight(20)
-        self.lbl_man_tag.setStyleSheet("font-size: 12px; font-weight: bold; color: #fbbf24; background: transparent; border: none;")
-        lay_man.addWidget(self.lbl_man_tag)
+        self.lbl_man_tag = QLabel(self.t("manual_tag"), self.card_manuale)
+        self.lbl_man_tag.hide()
 
         self.grp_modelli = QButtonGroup(self)
         self.grp_modelli.setExclusive(True)
@@ -3076,7 +4347,7 @@ class WhisperStudioWindow(QMainWindow):
         self.btn_large.setObjectName("btnLargeModello")
         self.btn_large.setProperty("class", "toggleBtn")
         self.btn_large.setCheckable(True)
-        self.btn_large.setFixedHeight(60)
+        self.btn_large.setFixedHeight(54)
         self.btn_large.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_large.clicked.connect(self._on_cambio_modello_manuale)
 
@@ -3084,7 +4355,7 @@ class WhisperStudioWindow(QMainWindow):
         self.btn_small.setObjectName("btnSmallModello")
         self.btn_small.setProperty("class", "toggleBtn")
         self.btn_small.setCheckable(True)
-        self.btn_small.setFixedHeight(60)
+        self.btn_small.setFixedHeight(54)
         self.btn_small.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_small.clicked.connect(self._on_cambio_modello_manuale)
 
@@ -3098,133 +4369,119 @@ class WhisperStudioWindow(QMainWindow):
 
         lay_man.addWidget(self.btn_large)
         lay_man.addWidget(self.btn_small)
+        self.card_manuale.setVisible(False)
+        model_group.addWidget(self.card_manuale)
 
+        # Avviso consiglio modello (visibile in entrambe le modalita', come macOS)
         self.lbl_warn_manuale = QLabel("")
         self.lbl_warn_manuale.setWordWrap(True)
-        self.lbl_warn_manuale.setMinimumHeight(52)
-        self.lbl_warn_manuale.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-        self.lbl_warn_manuale.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-        lay_man.addWidget(self.lbl_warn_manuale)
-
-        self.btn_torna_auto = QPushButton(self.t("btn_return_auto"))
-        self.btn_torna_auto.setObjectName("btnTornaAuto")
-        self.btn_torna_auto.setFixedHeight(36)
-        self.btn_torna_auto.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_torna_auto.setStyleSheet("""
-            QPushButton#btnTornaAuto {
-                background-color: #27272a;
-                color: #818cf8;
-                border: 1px solid #818cf8;
-                border-radius: 8px;
-                padding: 6px 10px;
-                font-size: 12px;
-                font-weight: bold;
-            }
-            QPushButton#btnTornaAuto:hover {
-                background-color: #2e2a52;
-                color: #ffffff;
-            }
-        """)
-        self.btn_torna_auto.clicked.connect(self._ripristina_modalita_automatica)
-        lay_man.addWidget(self.btn_torna_auto)
-
+        self.lbl_warn_manuale.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        model_group.addWidget(self.lbl_warn_manuale)
         self._aggiorna_avviso_manuale()
-        self.card_manuale.setVisible(False)
-        s_layout.addWidget(self.card_manuale)
+        s_layout.addLayout(model_group)
 
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet("background-color: #27272a; max-height: 1px; border: none;")
-        self.sep2 = sep2
-        s_layout.addWidget(sep2)
+        # --- Lingua audio ---
+        lang_group = QVBoxLayout()
+        lang_group.setSpacing(8)
 
-        # Selezione Lingua Audio
         self.lbl_l_title = QLabel(self.t("section_lang"))
         self.lbl_l_title.setObjectName("sectionTitle")
         self.lbl_l_title.setStyleSheet("background: transparent; border: none;")
-        s_layout.addWidget(self.lbl_l_title)
+        lang_group.addWidget(self.lbl_l_title)
 
-        self.grp_lingue = QButtonGroup(self)
-        self.grp_lingue.setExclusive(True)
-
-        h_lang = QHBoxLayout()
-        h_lang.setSpacing(8)
-
-        self.btn_it = FlagButton(self.t("btn_lang_primary"))
-        self.btn_it.setIcon(self._flag_icon_it if self.current_lang == "it" else self._flag_icon_en)
-        self.btn_it.setIconSize(QSize(20, 14))
-        self.btn_it.setProperty("class", "toggleBtn")
-        self.btn_it.setStyleSheet("text-align: center;")
-        self.btn_it.setCheckable(True)
-        self.btn_it.setChecked(True)
-        self.btn_it.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        self.btn_auto = QPushButton(self.t("btn_lang_auto"))
-        self.btn_auto.setProperty("class", "toggleBtn")
-        self.btn_auto.setStyleSheet("text-align: center;")
-        self.btn_auto.setCheckable(True)
-        self.btn_auto.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        self.grp_lingue.addButton(self.btn_it)
-        self.grp_lingue.addButton(self.btn_auto)
-
-        h_lang.addWidget(self.btn_it)
-        h_lang.addWidget(self.btn_auto)
-        s_layout.addLayout(h_lang)
+        self.seg_lingua = AnimatedSegmentedSwitch(
+            self.t("btn_lang_primary"),
+            self.t("btn_lang_auto"),
+            opt0_icon=(self._flag_icon_it if self.current_lang == "it" else self._flag_icon_en)
+        )
+        saved_audio_lang_idx = self.settings.value("audio_lang_idx", 0, type=int)
+        self.seg_lingua.set_current_index(1 if saved_audio_lang_idx == 1 else 0, animate=False, emit_signal=False)
+        self.seg_lingua.indexChanged.connect(lambda idx: self.settings.setValue("audio_lang_idx", int(idx)))
+        lang_group.addWidget(self.seg_lingua)
 
         self.lbl_sub_l = QLabel(self.t("lang_subtitle"))
         self.lbl_sub_l.setWordWrap(True)
-        self.lbl_sub_l.setStyleSheet("font-size: 11px; color: #71717a; background: transparent; border: none;")
-        s_layout.addWidget(self.lbl_sub_l)
+        self.lbl_sub_l.setStyleSheet("font-size: 11px; color: #a1a1aa; background: transparent; border: none;")
+        lang_group.addWidget(self.lbl_sub_l)
+        s_layout.addLayout(lang_group)
 
-        sep3 = QFrame()
-        sep3.setFrameShape(QFrame.Shape.HLine)
-        sep3.setStyleSheet("background-color: #27272a; max-height: 1px; border: none;")
-        self.sep3 = sep3
-        s_layout.addWidget(sep3)
+        # --- Formati di esportazione (card raggruppata con switch) ---
+        fmt_group = QVBoxLayout()
+        fmt_group.setSpacing(8)
 
-        # Formati di Esportazione
         self.lbl_f_title = QLabel(self.t("section_formats"))
         self.lbl_f_title.setObjectName("sectionTitle")
         self.lbl_f_title.setStyleSheet("background: transparent; border: none;")
-        s_layout.addWidget(self.lbl_f_title)
+        fmt_group.addWidget(self.lbl_f_title)
 
-        self.chk_txt = WindowsCheckBox(self.t("chk_txt"))
-        self.chk_txt.setChecked(True)
+        exp_txt = self.settings.value("export_txt", True, type=bool)
+        exp_docx = self.settings.value("export_docx", False, type=bool)
+        if not exp_txt and not exp_docx:
+            exp_txt = True
+            self.settings.setValue("export_txt", True)
 
-        self.chk_docx = WindowsCheckBox(self.t("chk_docx"))
-        self.chk_docx.setChecked(False)
+        self.chk_docx = AppleSwitchCheckBox(self.t("chk_docx"), icon_kind="docx", accent=True)
+        self.chk_docx.setChecked(exp_docx)
+        self.chk_docx.toggled.connect(self._on_toggle_docx)
 
-        s_layout.addWidget(self.chk_txt)
-        s_layout.addWidget(self.chk_docx)
+        self.chk_txt = AppleSwitchCheckBox(self.t("chk_txt"), icon_kind="txt", accent=False)
+        self.chk_txt.setChecked(exp_txt)
+        self.chk_txt.toggled.connect(self._on_toggle_txt)
+
+        fmt_card = QFrame()
+        fmt_card.setObjectName("formatsCard")
+        fmt_lay = QVBoxLayout(fmt_card)
+        fmt_lay.setContentsMargins(0, 0, 0, 0)
+        fmt_lay.setSpacing(0)
+        fmt_lay.addWidget(self.chk_docx)
+        fmt_div = QFrame()
+        fmt_div.setFixedHeight(1)
+        fmt_div.setStyleSheet("background-color: #27272a; border: none;")
+        fmt_lay.addWidget(fmt_div)
+        fmt_lay.addWidget(self.chk_txt)
+        fmt_group.addWidget(fmt_card)
 
         self.lbl_salva = QLabel(self.t("formats_subtitle"))
         self.lbl_salva.setWordWrap(True)
-        self.lbl_salva.setStyleSheet("font-size: 11px; color: #71717a; background: transparent; border: none;")
-        s_layout.addWidget(self.lbl_salva)
+        self.lbl_salva.setStyleSheet("font-size: 11px; color: #a1a1aa; background: transparent; border: none;")
+        fmt_group.addWidget(self.lbl_salva)
+        s_layout.addLayout(fmt_group)
 
         s_layout.addStretch()
 
+        # --- Footer con divisore superiore ---
+        footer = QFrame()
+        footer.setObjectName("sidebarFooter")
+        foot_lay = QHBoxLayout(footer)
+        foot_lay.setContentsMargins(18, 12, 18, 12)
         self.lbl_footer = QLabel(self.t("footer"))
-        self.lbl_footer.setStyleSheet("font-size: 11px; color: #52525b; background: transparent; border: none;")
-        s_layout.addWidget(self.lbl_footer)
+        self.lbl_footer.setStyleSheet("font-size: 11px; color: #71717a; background: transparent; border: none;")
+        foot_lay.addWidget(self.lbl_footer)
+        foot_lay.addStretch()
+        sb_outer.addWidget(footer)
 
         layout_orizzontale.addWidget(sidebar)
 
-        # 2. AREA DESTRA (CODA, STATO E CONTROLLI)
+        # ------------------------------------------------------------------
+        # 2. PANNELLO DESTRO: header coda / contenuto / dock azioni
+        # ------------------------------------------------------------------
         right_panel = QFrame()
         right_panel.setObjectName("rightPanel")
         right_panel.setAcceptDrops(True)
         r_layout = QVBoxLayout(right_panel)
-        r_layout.setContentsMargins(18, 16, 18, 16)
-        r_layout.setSpacing(12)
+        r_layout.setContentsMargins(0, 0, 0, 0)
+        r_layout.setSpacing(0)
 
-        # Header Coda File
-        q_header = QHBoxLayout()
+        # Header coda
+        q_header_frame = QFrame()
+        q_header_frame.setObjectName("queueHeader")
+        q_header = QHBoxLayout(q_header_frame)
+        q_header.setContentsMargins(20, 14, 20, 14)
+        q_header.setSpacing(10)
+
         self.lbl_coda_count = QLabel(self.t("queue_title", count=0))
-        self.lbl_coda_count.setStyleSheet("font-size: 15px; color: #ffffff;")
+        self.lbl_coda_count.setStyleSheet("font-size: 16px; font-weight: 600; color: #ffffff; background: transparent; border: none;")
         q_header.addWidget(self.lbl_coda_count)
-
         q_header.addStretch()
 
         self.btn_add = QPushButton(self.t("btn_add"))
@@ -3239,51 +4496,65 @@ class WhisperStudioWindow(QMainWindow):
         self.btn_clear.clicked.connect(self._svuota_coda)
         q_header.addWidget(self.btn_clear)
 
-        r_layout.addLayout(q_header)
+        r_layout.addWidget(q_header_frame)
 
-        # Lista Drag & Drop nativa
+        # Area contenuto (lista coda oppure drop zone centrata)
+        content_area = QFrame()
+        content_area.setObjectName("contentArea")
+        content_area.setAcceptDrops(True)
+        c_layout = QVBoxLayout(content_area)
+        c_layout.setContentsMargins(16, 10, 16, 12)
+        c_layout.setSpacing(0)
+
         self.queue_list = QueueListWidget()
         self.queue_list.fileDropped.connect(self._aggiungi_percorsi)
         self.queue_list.orderChanged.connect(self._on_item_reordered)
         self.queue_list.currentRowChanged.connect(self._on_riga_selezionata)
-        r_layout.addWidget(self.queue_list, 1)
+        c_layout.addWidget(self.queue_list, 1)
 
-        # Drop-zone vuota interattiva con supporto Drag & Drop e Click nativo
         self.empty_card = EmptyDropZone()
+        self.empty_card.setMinimumWidth(420)
+        self.empty_card.setMaximumWidth(460)
         self.empty_card.fileDropped.connect(self._aggiungi_percorsi)
         self.empty_card.clicked.connect(self._apri_dialogo_file)
         empty_layout = QVBoxLayout(self.empty_card)
-        empty_layout.setContentsMargins(20, 45, 20, 45)
-        empty_layout.setSpacing(8)
+        empty_layout.setContentsMargins(36, 36, 36, 36)
+        empty_layout.setSpacing(12)
         empty_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        lbl_icon = QLabel("📥")
-        lbl_icon.setStyleSheet("font-size: 42px; background: transparent; border: none;")
-        lbl_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_icon = QLabel()
+        lbl_icon.setPixmap(make_waveform_badge_pixmap(48, "#818cf8", "#18181c"))
+        lbl_icon.setFixedSize(48, 48)
+        lbl_icon.setStyleSheet("background: transparent; border: none;")
         lbl_icon.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        empty_layout.addWidget(lbl_icon)
+        empty_layout.addWidget(lbl_icon, 0, Qt.AlignmentFlag.AlignHCenter)
 
         self.lbl_empty_t = QLabel(self.t("empty_title"))
-        self.lbl_empty_t.setStyleSheet("font-size: 16px; color: #ffffff; background: transparent; border: none;")
+        self.lbl_empty_t.setStyleSheet("font-size: 16px; font-weight: 600; color: #ffffff; background: transparent; border: none;")
         self.lbl_empty_t.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_empty_t.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         empty_layout.addWidget(self.lbl_empty_t)
 
         self.lbl_empty_sub = QLabel(self.t("empty_subtitle"))
-        self.lbl_empty_sub.setStyleSheet("font-size: 12px; color: #a1a1aa; background: transparent; border: none;")
+        self.lbl_empty_sub.setStyleSheet("font-size: 13px; color: #a1a1aa; background: transparent; border: none;")
         self.lbl_empty_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_empty_sub.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         empty_layout.addWidget(self.lbl_empty_sub)
-        r_layout.addWidget(self.empty_card, 1)
+        c_layout.addWidget(self.empty_card, 0, Qt.AlignmentFlag.AlignCenter)
+
+        r_layout.addWidget(content_area, 1)
 
         self._aggiorna_vista_coda()
 
-        # Area Stato & Progresso
+        # Dock inferiore: stato + progresso + azioni
+        dock = QFrame()
+        dock.setObjectName("bottomDock")
+        dock_lay = QVBoxLayout(dock)
+        dock_lay.setContentsMargins(20, 16, 20, 16)
+        dock_lay.setSpacing(12)
+
         prog_box = QVBoxLayout()
         prog_box.setSpacing(6)
-
-        self.prog_bar = WhisperProgressBar()
-        prog_box.addWidget(self.prog_bar)
 
         status_row = QHBoxLayout()
         status_row.setSpacing(8)
@@ -3293,39 +4564,44 @@ class WhisperStudioWindow(QMainWindow):
         status_row.addWidget(self.spinner_loading, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.lbl_stato = QLabel(self.t("status_ready"))
-        self.lbl_stato.setStyleSheet("color: #d4d4d8; font-size: 12px; background: transparent;")
+        self.lbl_stato.setStyleSheet("color: #e4e4e7; font-size: 13px; background: transparent;")
         status_row.addWidget(self.lbl_stato, 0, Qt.AlignmentFlag.AlignVCenter)
         status_row.addStretch()
-
         prog_box.addLayout(status_row)
 
-        r_layout.addLayout(prog_box)
+        self.prog_bar = WhisperProgressBar()
+        prog_box.addWidget(self.prog_bar)
+        dock_lay.addLayout(prog_box)
 
-        # Riga Pulsanti Azione (ANNULLA, PAUSA, AVVIA)
+        # Azioni: PAUSA / ANNULLA compaiono solo durante un'operazione;
+        # a riposo c'e' un solo pulsante (AVVIA oppure SCARICA MODELLO).
         action_layout = QHBoxLayout()
-        action_layout.setSpacing(10)
-
-        self.btn_ferma = QPushButton(self.t("btn_cancel"))
-        self.btn_ferma.setObjectName("btnFerma")
-        self.btn_ferma.setEnabled(False)
-        self.btn_ferma.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_ferma.clicked.connect(self.ferma_trascrizione)
-        action_layout.addWidget(self.btn_ferma, 1)
+        action_layout.setSpacing(12)
 
         self.btn_pausa = QPushButton(self.t("btn_pause"))
         self.btn_pausa.setObjectName("btnPausa")
         self.btn_pausa.setEnabled(False)
         self.btn_pausa.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_pausa.clicked.connect(self.toggle_pausa)
+        self.btn_pausa.setVisible(False)
         action_layout.addWidget(self.btn_pausa, 1)
+
+        self.btn_ferma = QPushButton(self.t("btn_cancel"))
+        self.btn_ferma.setObjectName("btnFerma")
+        self.btn_ferma.setEnabled(False)
+        self.btn_ferma.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_ferma.clicked.connect(self.ferma_trascrizione)
+        self.btn_ferma.setVisible(False)
+        action_layout.addWidget(self.btn_ferma, 1)
 
         self.btn_avvia = QPushButton(self.t("btn_start"))
         self.btn_avvia.setObjectName("btnAvvia")
         self.btn_avvia.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_avvia.clicked.connect(self.avvia_trascrizione)
-        action_layout.addWidget(self.btn_avvia, 2)
+        action_layout.addWidget(self.btn_avvia, 1)
 
-        r_layout.addLayout(action_layout)
+        dock_lay.addLayout(action_layout)
+        r_layout.addWidget(dock)
         layout_orizzontale.addWidget(right_panel, 1)
 
         self.retranslate_ui()
@@ -3379,6 +4655,30 @@ class WhisperStudioWindow(QMainWindow):
             if self.thread_lavoro and self.thread_lavoro.isRunning() and hasattr(self.thread_lavoro, "emetti_progresso_totale"):
                 self.thread_lavoro.emetti_progresso_totale()
 
+    def _on_toggle_txt(self, checked: bool):
+        if not checked and not self.chk_docx.isChecked():
+            self.chk_docx.blockSignals(True)
+            self.chk_docx.setChecked(True)
+            self.chk_docx.blockSignals(False)
+            self.settings.setValue("export_docx", True)
+        self.settings.setValue("export_txt", bool(checked))
+
+    def _on_toggle_docx(self, checked: bool):
+        if not checked and not self.chk_txt.isChecked():
+            self.chk_txt.blockSignals(True)
+            self.chk_txt.setChecked(True)
+            self.chk_txt.blockSignals(False)
+            self.settings.setValue("export_txt", True)
+        self.settings.setValue("export_docx", bool(checked))
+
+    def _reset_stato_pronto_se_coda_vuota(self):
+        is_tr = bool(self.thread_lavoro and self.thread_lavoro.isRunning())
+        is_dl = bool(self.download_worker and self.download_worker.isRunning())
+        if not self.coda_files and not is_tr and not is_dl:
+            self.prog_bar.setValue(0)
+            self.lbl_stato.setStyleSheet("color: #e4e4e7; font-size: 13px; background: transparent;")
+            self.lbl_stato.setText(self.t("status_ready"))
+
     def _svuota_coda(self):
         if self.thread_lavoro and self.thread_lavoro.isRunning():
             with self.queue_lock:
@@ -3390,6 +4690,7 @@ class WhisperStudioWindow(QMainWindow):
         with self.queue_lock:
             self.coda_files.clear()
         self._aggiorna_vista_coda()
+        self._reset_stato_pronto_se_coda_vuota()
 
     def _rimuovi_file(self, index):
         if self.thread_lavoro and self.thread_lavoro.isRunning():
@@ -3408,40 +4709,25 @@ class WhisperStudioWindow(QMainWindow):
             if 0 <= index < len(self.coda_files):
                 self.coda_files.pop(index)
         self._aggiorna_vista_coda()
+        self._reset_stato_pronto_se_coda_vuota()
 
     def _on_item_reordered(self, src_idx, dst_idx):
-        if self.thread_lavoro and self.thread_lavoro.isRunning():
-            with self.queue_lock:
-                if not (0 <= src_idx < len(self.coda_files) and 0 <= dst_idx < len(self.coda_files)):
-                    self.queue_list.clearSelection()
-                    self.queue_list.setCurrentRow(-1)
-                    return
-                first_wait = -1
-                for i, it in enumerate(self.coda_files):
-                    if it.get("stato") == "in_attesa":
-                        first_wait = i
-                        break
-                if (
-                    first_wait < 0
-                    or src_idx < first_wait
-                    or dst_idx < first_wait
-                    or self.coda_files[src_idx].get("stato") != "in_attesa"
-                    or self.coda_files[dst_idx].get("stato") != "in_attesa"
-                ):
-                    self.queue_list.clearSelection()
-                    self.queue_list.setCurrentRow(-1)
-                    return
-                item = self.coda_files.pop(src_idx)
-                self.coda_files.insert(dst_idx, item)
-            self._aggiorna_vista_coda()
-            self.queue_list.clearSelection()
-            self.queue_list.setCurrentRow(-1)
-            return
-
         with self.queue_lock:
-            if 0 <= src_idx < len(self.coda_files) and 0 <= dst_idx < len(self.coda_files):
-                item = self.coda_files.pop(src_idx)
-                self.coda_files.insert(dst_idx, item)
+            if not (0 <= src_idx < len(self.coda_files) and 0 <= dst_idx < len(self.coda_files)):
+                self.queue_list.clearSelection()
+                self.queue_list.setCurrentRow(-1)
+                return
+            if src_idx == dst_idx:
+                return
+            if (
+                self.coda_files[src_idx].get("stato") != "in_attesa"
+                or self.coda_files[dst_idx].get("stato") != "in_attesa"
+            ):
+                self.queue_list.clearSelection()
+                self.queue_list.setCurrentRow(-1)
+                return
+            item = self.coda_files.pop(src_idx)
+            self.coda_files.insert(dst_idx, item)
         self._aggiorna_vista_coda()
         self.queue_list.clearSelection()
         self.queue_list.setCurrentRow(-1)
@@ -3479,6 +4765,8 @@ class WhisperStudioWindow(QMainWindow):
         self.queue_list.blockSignals(False)
 
     def _aggiorna_memoria_display(self):
+        if getattr(self, "download_worker", None) and self.download_worker.isRunning():
+            return
         if self.dev_type == "cuda":
             vinfo = get_vram_info()
             if vinfo:
@@ -3501,13 +4789,20 @@ class WhisperStudioWindow(QMainWindow):
     def _salva_impostazioni_modello(self):
         if getattr(self, "_initializing", False):
             return
+        remember_engine = self.settings.value("remember_engine_mode", True, type=bool)
+        if not remember_engine:
+            return
         modello = "large-v3" if self.btn_large.isChecked() else "turbo"
         self.settings.setValue("manual_mode", bool(self.modalita_manuale))
         self.settings.setValue("manual_model", modello)
         self.settings.sync()
 
     def _carica_impostazioni_modello(self):
-        manual_raw = self.settings.value("manual_mode", None)
+        remember_engine = self.settings.value("remember_engine_mode", True, type=bool)
+        if not remember_engine:
+            manual_raw = False
+        else:
+            manual_raw = self.settings.value("manual_mode", None)
         needs_sanitize = False
         if isinstance(manual_raw, bool):
             is_manual = manual_raw
@@ -3568,17 +4863,21 @@ class WhisperStudioWindow(QMainWindow):
 
         self._aggiorna_info_modello_auto()
         self._aggiorna_avviso_manuale()
+        if hasattr(self, "seg_mode"):
+            self.seg_mode.set_current_index(1 if self.modalita_manuale else 0, animate=False, emit_signal=False)
+        self._aggiorna_stato_pulsante_principale()
         self._aggiorna_vincoli_dimensione_finestra()
 
     def _on_cambio_modello_manuale(self):
         self._aggiorna_avviso_manuale()
         self._salva_impostazioni_modello()
+        self._aggiorna_stato_pulsante_principale()
 
     def _aggiorna_avviso_manuale(self):
         if not self.is_high_spec:
             if self.btn_large.isChecked():
                 testo = self.t("warn_large_low_spec")
-                stile = "background: transparent; border: none; color: #fbbf24; padding: 2px 2px; font-size: 11px; font-weight: 500;"
+                stile = "background: transparent; border: none; color: #f59e0b; padding: 2px 2px; font-size: 11px; font-weight: 500;"
             else:
                 testo = self.t("warn_turbo_low_spec")
                 stile = "background: transparent; border: none; color: #10b981; padding: 2px 2px; font-size: 11px; font-weight: 500;"
@@ -3588,26 +4887,39 @@ class WhisperStudioWindow(QMainWindow):
                 stile = "background: transparent; border: none; color: #10b981; padding: 2px 2px; font-size: 11px; font-weight: 500;"
             else:
                 testo = self.t("warn_turbo_high_spec")
-                stile = "background: transparent; border: none; color: #fbbf24; padding: 2px 2px; font-size: 11px; font-weight: 500;"
+                stile = "background: transparent; border: none; color: #f59e0b; padding: 2px 2px; font-size: 11px; font-weight: 500;"
         self.lbl_warn_manuale.setText(testo)
         self.lbl_warn_manuale.setStyleSheet(stile)
         if not getattr(self, "_initializing", False):
             self._salva_impostazioni_modello()
 
     def _imposta_abilitazione_modello(self, abilitato: bool):
-        self.btn_passa_manuale.setEnabled(abilitato)
+        if hasattr(self, "seg_mode"):
+            self.seg_mode.setEnabled(abilitato)
         self.btn_large.setEnabled(abilitato)
         self.btn_small.setEnabled(abilitato)
-        self.btn_torna_auto.setEnabled(abilitato)
-        self.btn_it.setEnabled(abilitato)
-        self.btn_auto.setEnabled(abilitato)
+        if hasattr(self, "seg_lingua"):
+            self.seg_lingua.setEnabled(abilitato)
         self.chk_txt.setEnabled(abilitato)
         self.chk_docx.setEnabled(abilitato)
         self.btn_add.setEnabled(True)
         self.btn_clear.setEnabled(True)
 
+    def _on_switch_mode_changed(self, idx: int):
+        is_busy = bool(
+            (self.thread_lavoro and self.thread_lavoro.isRunning())
+            or (self.download_worker and self.download_worker.isRunning())
+        )
+        if is_busy:
+            self.seg_mode.set_current_index(1 if self.modalita_manuale else 0, animate=False, emit_signal=False)
+            return
+        if idx == 1:
+            self._richiedi_passaggio_manuale()
+        else:
+            self._ripristina_modalita_automatica()
+
     def _richiedi_passaggio_manuale(self):
-        if self.thread_lavoro and self.thread_lavoro.isRunning():
+        if (self.thread_lavoro and self.thread_lavoro.isRunning()) or (self.download_worker and self.download_worker.isRunning()):
             return
         dlg = DialogoConfermaPassaggioManuale(lang=self.current_lang, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
@@ -3616,10 +4928,14 @@ class WhisperStudioWindow(QMainWindow):
             self.card_manuale.setVisible(True)
             self._aggiorna_avviso_manuale()
             self._salva_impostazioni_modello()
+            self._aggiorna_stato_pulsante_principale()
             self._aggiorna_vincoli_dimensione_finestra()
+        else:
+            if hasattr(self, "seg_mode"):
+                self.seg_mode.set_current_index(0, animate=True, emit_signal=False)
 
     def _ripristina_modalita_automatica(self):
-        if self.thread_lavoro and self.thread_lavoro.isRunning():
+        if (self.thread_lavoro and self.thread_lavoro.isRunning()) or (self.download_worker and self.download_worker.isRunning()):
             return
         self.modalita_manuale = False
         self.card_manuale.setVisible(False)
@@ -3631,12 +4947,37 @@ class WhisperStudioWindow(QMainWindow):
         self._aggiorna_info_modello_auto()
         self._aggiorna_avviso_manuale()
         self._salva_impostazioni_modello()
+        self._aggiorna_stato_pulsante_principale()
         self._aggiorna_vincoli_dimensione_finestra()
+
+    def _get_selected_model_id(self) -> str:
+        if not self.modalita_manuale:
+            return "large-v3" if self.is_high_spec else "turbo"
+        return "large-v3" if self.btn_large.isChecked() else "turbo"
+
+    def _aggiorna_stato_pulsante_principale(self):
+        if not hasattr(self, "btn_avvia"):
+            return
+        is_tr = bool(self.thread_lavoro and self.thread_lavoro.isRunning())
+        is_dl = bool(self.download_worker and self.download_worker.isRunning())
+        if is_tr or is_dl:
+            return
+        model_id = self._get_selected_model_id()
+        cached = is_model_cached(model_id)
+        self.btn_avvia.setProperty("downloadMode", "false" if cached else "true")
+        self.btn_avvia.setText(self.t("btn_start") if cached else self.t("btn_download_model"))
+        self.btn_avvia.style().unpolish(self.btn_avvia)
+        self.btn_avvia.style().polish(self.btn_avvia)
 
     # ----------------------------------------------------
     # GESTIONE TRASCRIZIONE
     # ----------------------------------------------------
     def avvia_trascrizione(self):
+        modello_scelto = self._get_selected_model_id()
+        if not is_model_cached(modello_scelto):
+            self._avvia_download_modello(modello_scelto)
+            return
+
         if not self.coda_files:
             QMessageBox.information(self, self.t("dlg_empty_title"), self.t("dlg_empty_msg"))
             return
@@ -3650,13 +4991,59 @@ class WhisperStudioWindow(QMainWindow):
             QMessageBox.warning(self, self.t("dlg_formats_title"), self.t("dlg_formats_msg"))
             return
 
-        if not self.modalita_manuale:
-            modello_scelto = "large-v3" if self.is_high_spec else "turbo"
-        else:
-            modello_scelto = "large-v3" if self.btn_large.isChecked() else "turbo"
+        # ----------------------------------------------------
+        # RISOLUZIONE DESTINAZIONE DELLA CODA
+        # ----------------------------------------------------
+        dest_mode = self.settings.value("dest_mode", "source", type=str)
+        resolved_dest_dir = None
+
+        if dest_mode == "custom":
+            custom_path_str = self.settings.value("custom_dest_folder", "", type=str)
+            if not custom_path_str:
+                QMessageBox.warning(
+                    self,
+                    self.t("err_dest_invalid_title"),
+                    self.t("err_dest_invalid_msg", path="(nessun percorso specificato)")
+                )
+                return
+            p_custom = Path(custom_path_str).resolve()
+            if not p_custom.exists() or not p_custom.is_dir() or not os.access(p_custom, os.W_OK):
+                QMessageBox.warning(
+                    self,
+                    self.t("err_dest_invalid_title"),
+                    self.t("err_dest_invalid_msg", path=str(p_custom))
+                )
+                return
+            resolved_dest_dir = p_custom
+
+        elif dest_mode == "ask":
+            # Mostra il selettore nativo una sola volta per l'intera coda
+            start_dir = str(self.coda_files[0]["path"].parent) if self.coda_files else str(Path.home())
+            scelta = QFileDialog.getExistingDirectory(
+                self,
+                self.t("dlg_choose_dest_title"),
+                start_dir,
+                QFileDialog.Option.ShowDirsOnly
+            )
+            if not scelta:
+                # Annullato dall'utente: nessuna trascrizione avviata
+                return
+            p_ask = Path(scelta).resolve()
+            if not p_ask.exists() or not os.access(p_ask, os.W_OK):
+                QMessageBox.warning(
+                    self,
+                    self.t("err_dest_invalid_title"),
+                    self.t("err_dest_invalid_msg", path=str(p_ask))
+                )
+                return
+            resolved_dest_dir = p_ask
+
+        # Modalità 'source': resolved_dest_dir rimane None (ciascun file userà la propria cartella sorgente)
+
+        modello_scelto = self._get_selected_model_id()
 
         lingua_primaria = "it" if self.current_lang == "it" else "en"
-        lingua_mode = lingua_primaria if self.btn_it.isChecked() else "auto"
+        lingua_mode = lingua_primaria if self.seg_lingua.current_index() == 0 else "auto"
 
         with self.queue_lock:
             if all(f.get("stato") == "completato" for f in self.coda_files):
@@ -3677,11 +5064,18 @@ class WhisperStudioWindow(QMainWindow):
                     else:
                         f["stato"] = "in_attesa"
 
+        local_p = find_local_model_path(modello_scelto)
+        model_cached = bool(local_p and is_model_dir_complete(Path(local_p)))
+
         self.btn_avvia.setEnabled(False)
-        self.btn_pausa.setEnabled(True)
+        self.btn_avvia.setVisible(False)
+        self.btn_ferma.setVisible(True)
+        self.btn_pausa.setEnabled(model_cached)
+        self.btn_pausa.setVisible(model_cached)
         self.btn_pausa.setText(self.t("btn_pause"))
         self.btn_pausa.setStyleSheet("")
         self.btn_ferma.setEnabled(True)
+        self.btn_ferma.setText(self.t("btn_cancel") if model_cached else self.t("btn_cancel_download"))
         self.prog_bar.setValue(0)
         self._imposta_abilitazione_modello(False)
 
@@ -3689,22 +5083,28 @@ class WhisperStudioWindow(QMainWindow):
         if hasattr(self, 'spinner_loading'):
             self.spinner_loading.start()
         self.lbl_stato.setStyleSheet("color: #fbbf24; font-size: 13px; font-weight: 600; background: transparent;")
-        self.lbl_stato.setText(self.t("status_loading_model"))
+        self.lbl_stato.setText(self.t("status_loading_model") if model_cached else self.t("status_downloading"))
 
         self._aggiorna_vista_coda()
 
         self.thread_lavoro = TrascrizioneWorkerThread(
             self.coda_files, modello_scelto, lingua_mode, formati,
             active_device=self.dev_type, active_compute=self.compute_type,
-            lang=self.current_lang, queue_lock=self.queue_lock
+            lang=self.current_lang, queue_lock=self.queue_lock, dest_dir=resolved_dest_dir
         )
         self.thread_lavoro.file_avviato.connect(self._on_file_avviato)
+        self.thread_lavoro.download_terminato.connect(self._on_download_terminato)
         self.thread_lavoro.progresso_file.connect(self._on_progresso_file)
         self.thread_lavoro.progresso_totale.connect(self._on_progresso_totale)
         self.thread_lavoro.file_completato.connect(self._on_file_completato)
         self.thread_lavoro.file_errore.connect(self._on_file_errore)
         self.thread_lavoro.coda_terminata.connect(self._on_coda_terminata)
         self.thread_lavoro.start()
+
+    def _on_download_terminato(self):
+        self.btn_pausa.setVisible(True)
+        self.btn_pausa.setEnabled(True)
+        self.btn_ferma.setText(self.t("btn_cancel"))
 
     def _on_file_avviato(self, idx: int, percorso: str):
         target_path = Path(percorso)
@@ -3748,7 +5148,7 @@ class WhisperStudioWindow(QMainWindow):
             target_card.aggiorna_stato("in_corso", perc, t_trasc, t_rim)
 
     def _on_progresso_totale(self, perc_tot: int, txt_tot: str):
-        self.lbl_stato.setStyleSheet("color: #d4d4d8; font-size: 12px; background: transparent;")
+        self.lbl_stato.setStyleSheet("color: #e4e4e7; font-size: 13px; background: transparent;")
         self.prog_bar.setValue(perc_tot)
         self.lbl_stato.setText(txt_tot)
         is_loading = any(k in txt_tot.lower() for k in ["inizializzaz", "initializ", "caricamento", "loading", "attendere", "wait"]) and not ("download modello:" in txt_tot.lower() or "downloading model:" in txt_tot.lower())
@@ -3800,18 +5200,23 @@ class WhisperStudioWindow(QMainWindow):
                     f["t_trasc"] = 0.0
                     f["t_rim"] = 0.0
         self.btn_avvia.setEnabled(True)
+        self.btn_avvia.setVisible(True)
+        self.btn_pausa.setVisible(False)
         self.btn_pausa.setEnabled(False)
         self.btn_pausa.setText(self.t("btn_pause"))
         self.btn_pausa.setStyleSheet("")
         self.btn_ferma.setEnabled(False)
+        self.btn_ferma.setVisible(False)
+        self.btn_ferma.setText(self.t("btn_cancel"))
         self.prog_bar.setValue(100 if completati > 0 else 0)
         self._imposta_abilitazione_modello(True)
+        self._aggiorna_stato_pulsante_principale()
 
         if cartella_out and cartella_out.startswith("Errore"):
             self.lbl_stato.setStyleSheet("color: #ef4444; font-size: 12px; font-weight: 600; background: transparent;")
             self.lbl_stato.setText(cartella_out)
         else:
-            self.lbl_stato.setStyleSheet("color: #d4d4d8; font-size: 12px; background: transparent;")
+            self.lbl_stato.setStyleSheet("color: #e4e4e7; font-size: 13px; background: transparent;")
             msg = self.t("finished_msg", count=completati) if completati > 0 else self.t("cancelled_msg")
             self.lbl_stato.setText(msg)
 
@@ -3822,7 +5227,77 @@ class WhisperStudioWindow(QMainWindow):
             if cartella_out and os.path.exists(cartella_out):
                 open_directory_in_explorer(cartella_out)
 
+    def _avvia_download_modello(self, model_id: str):
+        if self.download_worker and self.download_worker.isRunning():
+            return
+        self.btn_avvia.setEnabled(False)
+        self.btn_avvia.setVisible(False)
+        self.btn_ferma.setVisible(True)
+        self.btn_pausa.setVisible(True)
+        self.btn_pausa.setEnabled(True)
+        self.btn_pausa.setText(self.t("btn_pause_download"))
+        self.btn_pausa.setStyleSheet("")
+        self.btn_ferma.setEnabled(True)
+        self.btn_ferma.setText(self.t("btn_cancel_download"))
+        self.prog_bar.setValue(0)
+        self._imposta_abilitazione_modello(False)
+
+        if hasattr(self, 'spinner_loading'):
+            self.spinner_loading.start()
+        self.lbl_stato.setStyleSheet("color: #fbbf24; font-size: 13px; font-weight: 600; background: transparent;")
+        self.lbl_stato.setText(self.t("status_downloading"))
+
+        self.download_worker = ModelDownloadWorker(model_id, lang=self.current_lang)
+        self.download_worker.progresso_download.connect(self._on_download_worker_progresso)
+        self.download_worker.download_completato.connect(self._on_download_worker_finito)
+        self.download_worker.start()
+
+    def _on_download_worker_progresso(self, perc: int, txt: str):
+        self.lbl_stato.setStyleSheet("color: #e4e4e7; font-size: 13px; background: transparent;")
+        self.prog_bar.setValue(perc)
+        self.lbl_stato.setText(txt)
+        if hasattr(self, 'spinner_loading'):
+            self.spinner_loading.stop()
+
+    def _on_download_worker_finito(self, success: bool, status: str):
+        if hasattr(self, 'spinner_loading'):
+            self.spinner_loading.stop()
+        self.download_worker = None
+        self.btn_avvia.setEnabled(True)
+        self.btn_avvia.setVisible(True)
+        self.btn_pausa.setVisible(False)
+        self.btn_pausa.setEnabled(False)
+        self.btn_pausa.setText(self.t("btn_pause"))
+        self.btn_pausa.setStyleSheet("")
+        self.btn_ferma.setEnabled(False)
+        self.btn_ferma.setVisible(False)
+        self.btn_ferma.setText(self.t("btn_cancel"))
+        self._imposta_abilitazione_modello(True)
+
+        if success:
+            self.prog_bar.setValue(100)
+            self.lbl_stato.setStyleSheet("color: #10b981; font-size: 12px; font-weight: 600; background: transparent;")
+            self.lbl_stato.setText(self.t("status_download_done"))
+        elif status == "paused":
+            self.lbl_stato.setStyleSheet("color: #fbbf24; font-size: 12px; background: transparent;")
+            self.lbl_stato.setText(self.t("status_download_paused"))
+        elif status == "cancelled":
+            self.prog_bar.setValue(0)
+            self.lbl_stato.setStyleSheet("color: #e4e4e7; font-size: 13px; background: transparent;")
+            self.lbl_stato.setText(self.t("status_download_cancelled"))
+        else:
+            self.prog_bar.setValue(0)
+            self.lbl_stato.setStyleSheet("color: #ef4444; font-size: 12px; font-weight: 600; background: transparent;")
+            self.lbl_stato.setText(f"Errore download: {status}")
+
+        self._aggiorna_stato_pulsante_principale()
+
     def toggle_pausa(self):
+        if self.download_worker and self.download_worker.isRunning():
+            self.btn_pausa.setEnabled(False)
+            self.btn_ferma.setEnabled(False)
+            self.download_worker.pausa()
+            return
         if not self.thread_lavoro:
             return
         if not self.thread_lavoro.is_paused:
@@ -3831,27 +5306,57 @@ class WhisperStudioWindow(QMainWindow):
                 self.spinner_loading.stop()
             self.btn_pausa.setText(self.t("btn_resume"))
             self.btn_pausa.setStyleSheet("QPushButton#btnPausa { background-color: #10b981; } QPushButton#btnPausa:hover { background-color: #059669; }")
-            self.lbl_stato.setStyleSheet("color: #d4d4d8; font-size: 12px; background: transparent;")
+            self.lbl_stato.setStyleSheet("color: #e4e4e7; font-size: 13px; background: transparent;")
             self.lbl_stato.setText(self.t("status_paused"))
         else:
             self.thread_lavoro.riprendi()
             self.btn_pausa.setText(self.t("btn_pause"))
             self.btn_pausa.setStyleSheet("")
-            self.lbl_stato.setStyleSheet("color: #d4d4d8; font-size: 12px; background: transparent;")
+            self.lbl_stato.setStyleSheet("color: #e4e4e7; font-size: 13px; background: transparent;")
             self.lbl_stato.setText(self.t("status_resumed"))
 
     def ferma_trascrizione(self):
         if hasattr(self, 'spinner_loading'):
             self.spinner_loading.stop()
+        if self.download_worker and self.download_worker.isRunning():
+            self.btn_ferma.setEnabled(False)
+            self.btn_pausa.setEnabled(False)
+            self.lbl_stato.setStyleSheet("color: #e4e4e7; font-size: 13px; background: transparent;")
+            self.lbl_stato.setText(self.t("status_cancelling"))
+            worker = self.download_worker
+            for sig in (worker.progresso_download, worker.download_completato):
+                try:
+                    sig.disconnect()
+                except Exception:
+                    pass
+            worker.annulla()
+            if not worker.wait(400):
+                self._dangling_workers.append(worker)
+                worker.finished.connect(
+                    lambda w=worker: self._dangling_workers.remove(w) if w in self._dangling_workers else None
+                )
+            self._on_download_worker_finito(False, "cancelled")
+            return
         if not self.thread_lavoro:
             return
-        self.lbl_stato.setStyleSheet("color: #d4d4d8; font-size: 12px; background: transparent;")
+        self.btn_ferma.setEnabled(False)
+        self.btn_pausa.setEnabled(False)
+        self.lbl_stato.setStyleSheet("color: #e4e4e7; font-size: 13px; background: transparent;")
         self.lbl_stato.setText(self.t("status_cancelling"))
-        self.thread_lavoro.ferma()
-        self.thread_lavoro.wait()
+        try:
+            self.thread_lavoro.coda_terminata.disconnect(self._on_coda_terminata)
+        except Exception:
+            pass
+        self.thread_lavoro.ferma(delete_partial=True)
+        while self.thread_lavoro.isRunning():
+            QApplication.processEvents()
+            self.thread_lavoro.wait(50)
         self._on_coda_terminata(0, "")
 
     def closeEvent(self, event):
+        if self.download_worker and self.download_worker.isRunning():
+            self.download_worker.pausa()
+            self.download_worker.wait(1000)
         if self.thread_lavoro and self.thread_lavoro.isRunning():
             self.thread_lavoro.ferma()
             self.thread_lavoro.wait(3000)

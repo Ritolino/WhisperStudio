@@ -1,43 +1,39 @@
-# Byte-compiled / optimized / DLL files
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Python & PyInstaller build artifacts
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
-
-# C extensions & dylib builds
-*.o
-*.obj
-
-# Environments
-.env
-.venv
-env/
+*.egg-info/
+.venv/
 venv/
-ENV/
-
-# PyInstaller & Build artifacts
 build/
 dist/
-Whisper Studio.app/
+build_engine/
+dist_engine/
+.build/
+macOS/App/.build/
+xcuserdata/
+
+# Compiled binaries & platform distribution packages (published via GitHub Releases)
+*.app/
 *.dmg
+*.exe
+*.msi
+_internal/
 *.zip
-*.spec.bak
+macOS/ffmpeg
+Windows/models/
 
-# macOS system files
-.DS_Store
-.AppleDouble
-.LSOverride
-._*
-.Spotlight-V100
-.Trashes
-
-# Application cache & downloaded models
-.cache/
-models/
-huggingface/
-*.m4a
-*.mp3
-*.wav
-*.mp4
-*.mov
+# Local AI / dev coordination & paused platform
+AGENTS.md
+IMPLEMENTAZIONI.md
+BENCHMARK_MODELLI_ASR.md
+Macos.md
+Radicale_*.md
+Whisper Android/
+macOS/Screen/

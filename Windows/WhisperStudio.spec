@@ -1,4 +1,4 @@
-# -*- mode: python ; coding: utf-8 -*-
+﻿# -*- mode: python ; coding: utf-8 -*-
 import os
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
@@ -29,16 +29,32 @@ for mod in ['PyQt6', 'docx', 'huggingface_hub', 'faster_whisper', 'ctranslate2',
     binaries += tmp_ret[1]
     hiddenimports += tmp_ret[2]
 
-# Collect NVIDIA CUDA libraries if available
+# Collect NVIDIA CUDA libraries (cublas, cudnn, cuda_nvrtc) if available and deduplicate
 try:
     import site
-    for sp in site.getsitepackages():
-        cublas_bin = Path(sp) / "nvidia" / "cublas" / "bin"
-        if cublas_bin.is_dir():
-            for dll in cublas_bin.glob("*.dll"):
-                binaries.append((str(dll), '.'))
+    import sysconfig
+    site_roots = list(site.getsitepackages())
+    purelib = sysconfig.get_paths().get("purelib")
+    if purelib and purelib not in site_roots:
+        site_roots.append(purelib)
+    for sp in site_roots:
+        for sub in ("cublas", "cudnn", "cuda_nvrtc"):
+            cuda_bin = Path(sp) / "nvidia" / sub / "bin"
+            if cuda_bin.is_dir():
+                for dll in cuda_bin.glob("*.dll"):
+                    binaries.append((str(dll), '.'))
 except Exception:
     pass
+
+# Deduplicate binaries by filename to prevent multi-hundred-megabyte duplicate DLLs
+seen_bins = set()
+dedup_binaries = []
+for src, dst in binaries:
+    fname = os.path.basename(src).lower()
+    if fname not in seen_bins:
+        seen_bins.add(fname)
+        dedup_binaries.append((src, dst))
+binaries = dedup_binaries
 
 a = Analysis(
     [str(spec_dir / 'whisper_studio.py')],
@@ -60,7 +76,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='WhisperPortable',
+    name='WhisperStudio',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -81,5 +97,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='WhisperPortable',
+    name='WhisperStudio',
 )
