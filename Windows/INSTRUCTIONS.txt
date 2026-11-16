@@ -1,0 +1,90 @@
+========================================================================
+                          WHISPER STUDIO
+                Studio Edition (v3.0.5) — Windows Edition
+            Local AI-Powered Audio & Video Transcription Studio
+========================================================================
+
+ABOUT:
+A native, standalone, portable, and completely private Windows application 
+to transcribe any audio or video file into Plain Text (.txt) or Word (.docx).
+Featuring a modern dark PyQt6 graphical interface aligned with the macOS Edition 
+(v3.0.5), Whisper Studio requires no account, enforces no duration limits, 
+and is heavily optimized for dedicated NVIDIA GeForce RTX / GTX (CUDA) graphics 
+cards as well as multithreaded Intel and AMD processors.
+
+------------------------------------------------------------------------
+HOW TO LAUNCH:
+------------------------------------------------------------------------
+For users of the standalone portable package:
+▶ Double-click WhisperStudio.exe
+
+For developers / running from Python source code:
+▶ python whisper_studio.py
+
+No batch files, registry edits, or complex setup needed.
+Drag & drop from Windows Explorer is supported natively and fluidly.
+
+------------------------------------------------------------------------
+SMART MODEL DOWNLOAD (FIRST TIME ONLY):
+------------------------------------------------------------------------
+To keep the application download lightweight:
+1. On your very first transcription, if the selected AI model weights are not 
+   yet cached locally on your PC, Whisper Studio automatically downloads them 
+   directly from Hugging Face with a real-time progress bar and Mbps speed gauge:
+   - 💎 High Fidelity (Large-v3 Standard): ~3.08 GB (maximum accuracy).
+   - ⚡ High Speed (Turbo): ~1.6 GB (fluid, fast, and lightweight).
+2. For all subsequent operations, audio and video processing is 100% LOCAL on
+   your PC: no audio or transcript data ever leaves your computer (the app only
+   includes an asynchronous check for updates via GitHub Releases)!
+
+------------------------------------------------------------------------
+KEY FEATURES & USER GUIDE:
+------------------------------------------------------------------------
+1. MODERN DARK USER INTERFACE:
+   • Pixel-perfect alignment with the macOS Edition, featuring antialiased 
+     curved progress bars and responsive state transitions.
+   • Bilingual support with flags (🇮🇹 Italiano / 🇬🇧 English): switch languages 
+     instantly from the top "Language" menu without restarting the app!
+
+2. FILE IMPORT & METADATA:
+   • Drag and drop one or more audio/video files into the central drop zone 
+     (or click the "➕ Add Files" button).
+   • Each queued file displays its duration (⏱️ HH:MM:SS), file size, and path.
+
+3. DRAG & DROP QUEUE REORDERING:
+   • Freely reorder pending files by clicking and dragging cards up or down.
+   • Translucent preview follows the cursor, with a blue insertion target marker.
+
+4. AUTOMATIC & MANUAL MODEL SELECTION (WITH PERSISTENT MEMORY):
+   • Automatic Mode: Detects whether an NVIDIA GPU is present.
+     - NVIDIA GPU (≥6 GB VRAM) ➔ automatically uses Large-v3 Standard.
+     - AMD / Intel GPU or CPU ➔ automatically uses Large-v3 Turbo.
+   • Manual Mode: Freely choose between Large-v3 Standard and Turbo with 
+     hardware-aware advice.
+   • Persistent Memory: Your mode and model choice are remembered in QSettings 
+     across app restarts.
+
+5. SMART AUTOMATIC FILE NAMING:
+   • Transcripts are automatically saved in the selected output folder
+     (beside the source file by default).
+   • Custom file titles are preserved verbatim (e.g. "EGI 12 novembre.m4a"
+     ➔ "Trascrizione EGI 12 novembre.[ext]"), while generic recorder
+     timestamps are cleaned up as "Trascrizione DD-MM-YY - HH.MM.[ext]".
+   • Protected against Windows file locks and duplicate collisions via
+     progressive numbering (2), (3).
+
+6. PROCESSING CONTROLS:
+   • 🚀 START TRANSCRIPTION: Sequentially processes the queue.
+   • ⏸ PAUSE / ▶ RESUME: Pause execution at any time.
+   • ■ CANCEL: Safely stops execution, saves current progress, and frees memory.
+
+7. AUTOMATIC MEMORY RECLAIM:
+   • Completely unloads the neural model from VRAM and RAM upon batch completion.
+   • Automatic GPU-to-CPU runtime fallback ensures zero transcription failures.
+
+------------------------------------------------------------------------
+SUPPORTED FORMATS:
+------------------------------------------------------------------------
+MP3, WAV, M4A, AAC, MP4, MKV, FLAC, OGG, WEBM, AVI, MOV, WMA, ALAC, OPUS, AIFF.
+
+========================================================================
